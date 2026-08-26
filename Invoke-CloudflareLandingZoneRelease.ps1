@@ -40,6 +40,12 @@
     If specified, only creates and synchronises the deployment repository.
 .PARAMETER OnlyModules
     If specified, only creates and synchronises the module repositories.
+.PARAMETER ForceDeploymentUpdate
+    Re-releases the deployment repository even though it has already been seeded.
+    By default an existing deployment repository is skipped, because a release wipes and
+    re-copies the working tree, which would revert operator edits under 'accounts/**' and
+    delete any account file added there that does not exist upstream. Module repositories
+    are unaffected: they carry no per-tenant content and are always re-synchronised.
 .PARAMETER AllowForcePush
     Permits overwriting remote history when a target repository already carries unrelated commits.
     Without this switch such a repository is reported as failed rather than being overwritten.
@@ -114,6 +120,9 @@ param (
 
     [Parameter(Mandatory = $false)]
     [switch]$OnlyModules,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$ForceDeploymentUpdate,
 
     [Parameter(Mandatory = $false)]
     [switch]$AllowForcePush,
@@ -335,6 +344,9 @@ if (-not [string]::IsNullOrWhiteSpace($SaveConfig)) {
 if ($isDryRun) {
     Write-SectionHeader -Title "Dry Run Complete"
     Write-ReleaseInfo "Dry-run / WhatIf requested. No remote repositories or commits were created."
+    if (-not $OnlyModules.IsPresent -and $config.SeedDeploymentOnce -and -not $ForceDeploymentUpdate.IsPresent) {
+        Write-ReleaseInfo "Note: an already-seeded deployment repository is skipped at execution time. Use -ForceDeploymentUpdate to re-release it."
+    }
     return $releasePlan
 }
 
@@ -384,6 +396,27 @@ foreach ($planItem in $releasePlan) {
         # A. Verify / Create Remote GitHub Repository
         Write-ReleaseInfo "Checking remote repository '$($planItem.TargetOwner)/$($planItem.RepoName)' on GitHub..."
         $existingRepo = Get-GitHubRepoDetails -Token $token -Owner $planItem.TargetOwner -RepoName $planItem.RepoName
+        $authPushUrl = "https://x-access-token:$token@github.com/$($planItem.TargetOwner)/$($planItem.RepoName).git"
+
+        $remoteHasCommits = $false
+        if ($existingRepo.Exists) {
+            $remoteState = Get-RemoteRepositoryState -WorkingDirectory $stagingRoot -AuthenticatedUrl $authPushUrl -DefaultBranch $config.DefaultBranch
+            $remoteHasCommits = -not $remoteState.IsEmpty
+        }
+
+        $releaseAction = Get-ComponentReleaseAction `
+            -ComponentType $planItem.ComponentType `
+            -RepoExists $existingRepo.Exists `
+            -RemoteHasCommits $remoteHasCommits `
+            -SeedDeploymentOnce ([bool]$config.SeedDeploymentOnce) `
+            -ForceDeploymentUpdate $ForceDeploymentUpdate.IsPresent
+
+        if ($releaseAction.Action -eq "Skip") {
+            $itemResult.Status = "Skipped"
+            Write-ReleaseWarning $releaseAction.Reason
+            $results.Add($itemResult)
+            continue
+        }
 
         if ($existingRepo.Exists) {
             Write-ReleaseInfo "Repository already exists on GitHub; the release will be applied as an update."
@@ -399,7 +432,6 @@ foreach ($planItem in $releasePlan) {
 
         # B. Prepare the staging working tree, preserving any existing remote history
         $itemStagingDir = Join-Path -Path $stagingRoot -ChildPath $planItem.RepoName
-        $authPushUrl = "https://x-access-token:$token@github.com/$($planItem.TargetOwner)/$($planItem.RepoName).git"
 
         $stagingState = Initialize-StagingRepository `
             -StagingPath $itemStagingDir `
@@ -462,7 +494,7 @@ if ($CleanStaging -and (Test-Path -Path $stagingRoot)) {
 
 # 8. Final Summary
 Write-SectionHeader -Title "Release Execution Summary"
-$successCount = @($results | Where-Object { $_.Status -in @("Completed", "Unchanged") }).Count
+$successCount = @($results | Where-Object { $_.Status -in @("Completed", "Unchanged", "Skipped") }).Count
 $failedCount = @($results | Where-Object { $_.Status -eq "Failed" }).Count
 
 Write-Host ("{0,-28} | {1,-52} | {2,-12}" -f "Component", "Repository", "Status") -ForegroundColor Cyan
@@ -471,6 +503,7 @@ foreach ($res in $results) {
     $col = switch ($res.Status) {
         "Completed" { [System.ConsoleColor]::Green }
         "Unchanged" { [System.ConsoleColor]::DarkGray }
+        "Skipped" { [System.ConsoleColor]::Yellow }
         default { [System.ConsoleColor]::Red }
     }
     Write-Host ("{0,-28} | {1,-52} | {2,-12}" -f $res.ComponentName, $res.RepoName, $res.Status) -ForegroundColor $col

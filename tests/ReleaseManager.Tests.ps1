@@ -31,6 +31,7 @@ Describe "Configuration Manager" {
             $config.Prefix | Should -Be "cflz"
             $config.DeploymentRepoName | Should -Be "{prefix}-deployment"
             $config.ModuleRepoPattern | Should -Be "terraform-cloudflare-lz-{module}"
+            $config.SeedDeploymentOnce | Should -Be $true
             $config.Visibility | Should -Be "private"
             $config.DefaultBranch | Should -Be "main"
             $config.UpstreamRepoUrl | Should -Be "https://github.com/itsharryshelton/CloudflareLandingZone.git"
@@ -352,6 +353,89 @@ Describe "Publishing Mechanics" {
     }
 }
 
+Describe "Re-run Policy" {
+    Context "Get-ComponentReleaseAction" {
+        It "Should create a component whose repository does not exist" {
+            (Get-ComponentReleaseAction -ComponentType "Deployment" -RepoExists $false -RemoteHasCommits $false).Action | Should -Be "Create"
+            (Get-ComponentReleaseAction -ComponentType "Module" -RepoExists $false -RemoteHasCommits $false).Action | Should -Be "Create"
+        }
+
+        It "Should complete the initial release when the repository exists but carries no commits" {
+            # Creation succeeded but the first push failed; a retry must still seed it.
+            (Get-ComponentReleaseAction -ComponentType "Deployment" -RepoExists $true -RemoteHasCommits $false).Action | Should -Be "Create"
+        }
+
+        It "Should always re-synchronise module repositories" {
+            $action = Get-ComponentReleaseAction -ComponentType "Module" -RepoExists $true -RemoteHasCommits $true
+            $action.Action | Should -Be "Update"
+        }
+
+        It "Should skip an already-seeded deployment repository so operator edits survive" {
+            $action = Get-ComponentReleaseAction -ComponentType "Deployment" -RepoExists $true -RemoteHasCommits $true
+            $action.Action | Should -Be "Skip"
+            $action.Reason | Should -Match "ForceDeploymentUpdate"
+        }
+
+        It "Should re-release a seeded deployment repository when explicitly forced" {
+            (Get-ComponentReleaseAction -ComponentType "Deployment" -RepoExists $true -RemoteHasCommits $true -ForceDeploymentUpdate $true).Action |
+                Should -Be "Update"
+        }
+
+        It "Should re-release a seeded deployment repository when the seed-once policy is disabled" {
+            (Get-ComponentReleaseAction -ComponentType "Deployment" -RepoExists $true -RemoteHasCommits $true -SeedDeploymentOnce $false).Action |
+                Should -Be "Update"
+        }
+    }
+
+    Context "Mirror semantics for module repositories" {
+        It "Should revert edits and remove files added directly to a published module repository" {
+            $testRoot = New-TestWorkspace
+            try {
+                $remote = Join-Path -Path $testRoot -ChildPath "remote.git"
+                $source = Join-Path -Path $testRoot -ChildPath "source"
+                $staging = Join-Path -Path $testRoot -ChildPath "staging"
+                $consumer = Join-Path -Path $testRoot -ChildPath "consumer"
+
+                Invoke-GitCommand -WorkingDirectory $testRoot -Arguments @("init", "--bare", "-b", "main", $remote) | Out-Null
+                New-Item -Path $source -ItemType Directory -Force | Out-Null
+                Set-Content -Path (Join-Path -Path $source -ChildPath "main.tf") -Value 'variable "a" {}'
+
+                Initialize-StagingRepository -StagingPath $staging -RemoteUrl $remote -AuthenticatedUrl $remote -DefaultBranch "main" | Out-Null
+                Copy-SourceDataAsIs -SourceDirectory $source -DestinationDirectory $staging -ComponentType "Module" | Out-Null
+                Publish-LocalRepository -StagingPath $staging -RemoteUrl $remote -AuthenticatedPushUrl $remote -DefaultBranch "main" -CommitMessage "Initial release" | Out-Null
+
+                # A consumer edits the published repository directly and adds a file of their own.
+                Invoke-GitCommand -WorkingDirectory $testRoot -Arguments @("clone", $remote, $consumer) | Out-Null
+                Invoke-GitCommand -WorkingDirectory $consumer -Arguments @("config", "user.email", "ops@localhost") | Out-Null
+                Invoke-GitCommand -WorkingDirectory $consumer -Arguments @("config", "user.name", "Ops") | Out-Null
+                Set-Content -Path (Join-Path -Path $consumer -ChildPath "main.tf") -Value 'variable "edited_locally" {}'
+                Set-Content -Path (Join-Path -Path $consumer -ChildPath "extra.tf") -Value 'output "extra" {}'
+                Invoke-GitCommand -WorkingDirectory $consumer -Arguments @("add", "-A") | Out-Null
+                Invoke-GitCommand -WorkingDirectory $consumer -Arguments @("commit", "-m", "Local customisation") | Out-Null
+                Invoke-GitCommand -WorkingDirectory $consumer -Arguments @("push", "origin", "main") | Out-Null
+
+                # Re-release from unchanged source.
+                Remove-Item -Path $staging -Recurse -Force
+                Initialize-StagingRepository -StagingPath $staging -RemoteUrl $remote -AuthenticatedUrl $remote -DefaultBranch "main" | Out-Null
+                Copy-SourceDataAsIs -SourceDirectory $source -DestinationDirectory $staging -ComponentType "Module" | Out-Null
+                $publish = Publish-LocalRepository -StagingPath $staging -RemoteUrl $remote -AuthenticatedPushUrl $remote -DefaultBranch "main" -CommitMessage "Update release"
+
+                $publish.Committed | Should -Be $true
+
+                # Source content wins: the edit is reverted and the consumer's extra file is removed.
+                (Invoke-GitCommand -WorkingDirectory $remote -Arguments @("show", "main:main.tf")).Output | Should -Be 'variable "a" {}'
+                (Invoke-GitCommand -WorkingDirectory $remote -Arguments @("ls-tree", "-r", "--name-only", "main")).Output | Should -Not -Match "extra.tf"
+
+                # The consumer's commit remains in history, so the change is recoverable.
+                (Invoke-GitCommand -WorkingDirectory $remote -Arguments @("log", "--oneline", "main")).Output | Should -Match "Local customisation"
+            }
+            finally {
+                if (Test-Path -Path $testRoot) { Remove-Item -Path $testRoot -Recurse -Force }
+            }
+        }
+    }
+}
+
 Describe "Release Plan Generation (Dry Run)" {
     Context "Invoke-CloudflareLandingZoneRelease -WhatIf" {
         It "Should generate execution plan with 15 total repositories (1 deployment + 14 modules)" {
@@ -403,7 +487,7 @@ Describe "Release Plan Generation (Dry Run)" {
             $plan.RepoName | Should -Be "terraform-cloudflare-lz-waf"
 
             $custom = & $scriptPath -TargetOwner "test-org" -WhatIf -SourceRoot $script:SourceMonorepo `
-                -Prefix "cflzs" -DeploymentRepoName "{prefix}-landing-zone" -ModuleRepoPattern "{prefix}-tf-{module}" -OnlyDeployment
+                -Prefix "cflz" -DeploymentRepoName "{prefix}-landing-zone" -ModuleRepoPattern "{prefix}-tf-{module}" -OnlyDeployment
 
             $custom.RepoName | Should -Be "cflz-landing-zone"
         }

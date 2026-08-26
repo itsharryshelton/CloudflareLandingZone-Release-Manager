@@ -249,6 +249,63 @@ function Invoke-GitCommand {
     }
 }
 
+function Get-ComponentReleaseAction {
+    <#
+    .SYNOPSIS
+        Decides whether a component should be created, updated, or skipped.
+    .DESCRIPTION
+        Module repositories are strict mirrors of the source: they carry no per-tenant content,
+        so re-running always re-synchronises them.
+
+        The deployment repository is different. Its 'accounts/**' tree is exactly where an
+        operator enters real account identifiers and zones after the repository is handed over.
+        Because a release wipes the working tree and re-copies from source, a re-run would revert
+        those edits and delete any file the operator added that does not exist upstream. Under the
+        default seed-once policy the deployment repository is therefore published exactly once and
+        skipped on every subsequent run, unless an update is explicitly requested.
+
+        A repository that exists but carries no commits (for example, creation succeeded but the
+        first push failed) is still treated as unseeded, so a retry completes the initial release.
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("Deployment", "Module")]
+        [string]$ComponentType,
+
+        [Parameter(Mandatory = $true)]
+        [bool]$RepoExists,
+
+        [Parameter(Mandatory = $true)]
+        [bool]$RemoteHasCommits,
+
+        [Parameter(Mandatory = $false)]
+        [bool]$SeedDeploymentOnce = $true,
+
+        [Parameter(Mandatory = $false)]
+        [bool]$ForceDeploymentUpdate = $false
+    )
+
+    if (-not $RepoExists -or -not $RemoteHasCommits) {
+        return [PSCustomObject]@{
+            Action = "Create"
+            Reason = if ($RepoExists) { "Repository exists but carries no commits; completing the initial release." } else { "Repository does not exist yet." }
+        }
+    }
+
+    if ($ComponentType -eq "Deployment" -and $SeedDeploymentOnce -and -not $ForceDeploymentUpdate) {
+        return [PSCustomObject]@{
+            Action = "Skip"
+            Reason = "Deployment repository has already been seeded. Operator edits under 'accounts/**' would be reverted by a re-release, so it is skipped. Use -ForceDeploymentUpdate to override."
+        }
+    }
+
+    return [PSCustomObject]@{
+        Action = "Update"
+        Reason = "Repository already exists; synchronising source content."
+    }
+}
+
 function Sync-UpstreamSource {
     <#
     .SYNOPSIS
@@ -515,6 +572,7 @@ function Publish-LocalRepository {
 Export-ModuleMember -Function @(
     "Copy-SourceDataAsIs",
     "Sync-UpstreamSource",
+    "Get-ComponentReleaseAction",
     "Initialize-StagingRepository",
     "Get-RemoteRepositoryState",
     "Publish-LocalRepository",

@@ -64,6 +64,48 @@ Or override either template outright:
 
 ---
 
+## Re-run Behaviour
+
+Re-running against the same GitHub account is safe and idempotent, but the two component types deliberately behave differently.
+
+### Module repositories are strict mirrors
+
+Every run wipes the staging working tree, re-copies from source, and commits the difference. Source content always wins:
+
+| Situation | Result |
+| :--- | :--- |
+| Source unchanged | No commit. Reported as `Unchanged` |
+| Source changed | One commit on top of existing history. Reported as `Completed` |
+| File removed at source | Deletion is committed |
+| File edited directly in the published repo | **Reverted** to source content |
+| File added directly in the published repo | **Deleted** — it does not exist at source |
+
+The last two matter. A published module repository is a mirror, not a working copy. Edits made directly to it are undone on the next release. The overwriting commit is ordinary Git history, so the change is recoverable with `git revert`, but nobody is notified that it happened. Consumers should fork or vendor these repositories rather than editing them in place.
+
+### The deployment repository is seeded once
+
+`accounts/**` is exactly where an operator enters real account identifiers and zones after the repository is handed over. Applying mirror semantics there would revert those edits and delete any account file added that does not exist upstream.
+
+So by default the deployment repository is published **once**. On any subsequent run, if it already exists and carries commits, it is skipped before anything is fetched, staged, or pushed:
+
+```
+[WARNING] Deployment repository has already been seeded. Operator edits under 'accounts/**'
+          would be reverted by a re-release, so it is skipped. Use -ForceDeploymentUpdate to override.
+deployment | cflz-deployment | Skipped
+```
+
+A repository that exists but carries no commits — creation succeeded, first push failed — is still treated as unseeded, so a retry completes the initial release.
+
+To deliberately re-release it, overwriting operator changes:
+
+```powershell
+.\Invoke-CloudflareLandingZoneRelease.ps1 -TargetOwner "YourOrgOrUsername" -OnlyDeployment -ForceDeploymentUpdate
+```
+
+Set `"SeedDeploymentOnce": false` in a configuration file to make the deployment repository behave as a strict mirror like the modules.
+
+---
+
 ## Prerequisites
 
 1. **PowerShell 7+** (`pwsh`).
@@ -174,6 +216,7 @@ Save current settings to a new configuration file:
 | `-ExcludeModules` | String[] | `@()` | Module folder names to omit from the release. |
 | `-OnlyDeployment` | Switch | `false` | When set, only processes the deployment framework. |
 | `-OnlyModules` | Switch | `false` | When set, only processes modules. |
+| `-ForceDeploymentUpdate` | Switch | `false` | Re-releases an already-seeded deployment repository, overwriting operator edits under `accounts/**`. |
 | `-AllowForcePush` | Switch | `false` | Permits overwriting remote history. Without it, a target repository carrying unrelated commits is reported as failed rather than overwritten. |
 | `-ConfigFile` | String | `$null` | Path to JSON configuration file. |
 | `-SaveConfig` | String | `$null` | Path to export current configuration JSON. |

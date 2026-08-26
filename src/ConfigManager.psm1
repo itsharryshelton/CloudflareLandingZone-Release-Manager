@@ -29,6 +29,7 @@ function Get-ReleaseDefaultConfig {
         Prefix              = "cflz"
         DeploymentRepoName  = "{prefix}-deployment"
         ModuleRepoPattern   = "terraform-cloudflare-lz-{module}"
+        SeedDeploymentOnce  = $true
         Visibility          = "private"
         DefaultBranch       = "main"
         TargetOwner         = ""
@@ -148,6 +149,7 @@ function Export-ReleaseConfigFile {
         Prefix             = $Config.Prefix
         DeploymentRepoName = $Config.DeploymentRepoName
         ModuleRepoPattern  = $Config.ModuleRepoPattern
+        SeedDeploymentOnce = $Config.SeedDeploymentOnce
         Visibility         = $Config.Visibility
         DefaultBranch      = $Config.DefaultBranch
         TargetOwner        = $Config.TargetOwner
