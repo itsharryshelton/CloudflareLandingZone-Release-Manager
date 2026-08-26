@@ -436,6 +436,37 @@ Describe "Re-run Policy" {
     }
 }
 
+Describe "Organisation Targeting" {
+    Context "Get-NewRepositoryPayload" {
+        It "Should send the explicit visibility field for organisation repositories" {
+            $payload = Get-NewRepositoryPayload -RepoName "cflz-deployment" -OwnerType "Organization" -Visibility "internal"
+            $payload.visibility | Should -Be "internal"
+            $payload.private | Should -Be $true
+            $payload.auto_init | Should -Be $false
+        }
+
+        It "Should mark private and public organisation repositories correctly" {
+            (Get-NewRepositoryPayload -RepoName "r" -OwnerType "Organization" -Visibility "private").visibility | Should -Be "private"
+            (Get-NewRepositoryPayload -RepoName "r" -OwnerType "Organization" -Visibility "private").private | Should -Be $true
+
+            $public = Get-NewRepositoryPayload -RepoName "r" -OwnerType "Organization" -Visibility "public"
+            $public.visibility | Should -Be "public"
+            $public.private | Should -Be $false
+        }
+
+        It "Should omit the visibility field for user repositories" {
+            $payload = Get-NewRepositoryPayload -RepoName "r" -OwnerType "User" -Visibility "private"
+            $payload.ContainsKey("visibility") | Should -Be $false
+            $payload.private | Should -Be $true
+        }
+
+        It "Should reject internal visibility on a user account rather than silently creating a private repository" {
+            { Get-NewRepositoryPayload -RepoName "r" -OwnerType "User" -Visibility "internal" } |
+                Should -Throw -ExpectedMessage "*only available for organisation repositories*"
+        }
+    }
+}
+
 Describe "Release Plan Generation (Dry Run)" {
     Context "Invoke-CloudflareLandingZoneRelease -WhatIf" {
         It "Should generate execution plan with 15 total repositories (1 deployment + 14 modules)" {

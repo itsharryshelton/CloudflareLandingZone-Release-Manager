@@ -267,6 +267,7 @@ if ([string]::IsNullOrWhiteSpace($config.TargetOwner)) {
 
 # Determine Target Owner Type (Organisation vs User)
 $ownerDetails = $null
+$ownerResolutionError = $null
 if (-not [string]::IsNullOrWhiteSpace($token)) {
     try {
         $ownerDetails = Get-GitHubOwnerType -Token $token -Owner $config.TargetOwner
@@ -274,10 +275,12 @@ if (-not [string]::IsNullOrWhiteSpace($token)) {
             Write-ReleaseInfo "Target owner '$($config.TargetOwner)' resolved as: $($ownerDetails.Type)."
         }
         else {
+            $ownerResolutionError = "The owner does not exist, or is not visible to the supplied token."
             Write-ReleaseWarning "Target owner '$($config.TargetOwner)' was not found or is inaccessible with current token."
         }
     }
     catch {
+        $ownerResolutionError = $_.Exception.Message
         Write-ReleaseWarning "Could not verify owner type: $($_.Exception.Message)"
     }
 }
@@ -363,6 +366,28 @@ if ([string]::IsNullOrWhiteSpace($token)) {
     throw [System.InvalidOperationException]::new("A valid GitHub Personal Access Token is required to execute repository publishing.")
 }
 
+# The owner type decides the creation endpoint: '/orgs/{owner}/repos' or '/user/repos'.
+# Guessing 'User' when the organisation lookup failed would silently create every repository
+# under the authenticated account instead of the organisation, and still report success.
+# An organisation enforcing SAML SSO returns 403 to an unauthorised token, which is exactly
+# the case that must not be guessed.
+if ($null -eq $ownerDetails -or -not $ownerDetails.Found) {
+    $detail = if ($ownerResolutionError) { " Reason: $ownerResolutionError" } else { "" }
+    throw [System.InvalidOperationException]::new(
+        "Unable to confirm whether target owner '$($config.TargetOwner)' is an organisation or a user account.$detail " +
+        "Refusing to continue, because assuming a user account would create the repositories under the authenticated account " +
+        "instead of the intended owner. If the target is an organisation enforcing SAML SSO, authorise the token for that " +
+        "organisation; a fine-grained token additionally requires 'Administration: Read and write' on the organisation.")
+}
+
+$ownerType = $ownerDetails.Type
+
+if ($config.Visibility -eq "internal" -and $ownerType -ne "Organization") {
+    throw [System.InvalidOperationException]::new(
+        "Visibility 'internal' is only available for organisation repositories on GitHub Enterprise Cloud. " +
+        "Target owner '$($config.TargetOwner)' resolved as '$ownerType'.")
+}
+
 # 6. Execute Repository Creation and Publishing
 Write-SectionHeader -Title "Executing Releases"
 
@@ -373,7 +398,6 @@ if (-not (Test-Path -Path $stagingRoot)) {
 $results = [System.Collections.Generic.List[object]]::new()
 $stepIndex = 1
 $totalSteps = @($releasePlan).Count
-$ownerType = if ($ownerDetails -and $ownerDetails.Type -and $ownerDetails.Found) { $ownerDetails.Type } else { "User" }
 
 foreach ($planItem in $releasePlan) {
     Write-ReleaseStep -StepNumber $stepIndex -TotalSteps $totalSteps -Description "Processing $($planItem.ComponentType) [$($planItem.ComponentName)] -> $($planItem.RepoName)"
@@ -424,8 +448,7 @@ foreach ($planItem in $releasePlan) {
         else {
             Write-ReleaseInfo "Creating new $($planItem.Visibility) repository '$($planItem.RepoName)' under '$($planItem.TargetOwner)'..."
             $desc = "Cloudflare Landing Zone - $($planItem.ComponentType): $($planItem.ComponentName)"
-            $isPriv = ($planItem.Visibility -ne "public")
-            New-GitHubRemoteRepository -Token $token -Owner $planItem.TargetOwner -OwnerType $ownerType -RepoName $planItem.RepoName -Description $desc -IsPrivate $isPriv | Out-Null
+            New-GitHubRemoteRepository -Token $token -Owner $planItem.TargetOwner -OwnerType $ownerType -RepoName $planItem.RepoName -Description $desc -Visibility $planItem.Visibility | Out-Null
             $itemResult.RepoCreated = $true
             Write-ReleaseSuccess "Remote repository created successfully."
         }

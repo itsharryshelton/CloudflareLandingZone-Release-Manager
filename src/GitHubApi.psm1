@@ -290,6 +290,53 @@ function Get-GitHubRepoDetails {
     }
 }
 
+function Get-NewRepositoryPayload {
+    <#
+    .SYNOPSIS
+        Builds the request body for repository creation.
+    .DESCRIPTION
+        The REST API expresses visibility two ways. 'private' is a boolean understood by both
+        user and organisation repositories. 'internal' exists only for organisation repositories
+        on GitHub Enterprise Cloud and must be sent in the 'visibility' field: sending only
+        'private = $true' would silently create an ordinary private repository instead.
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$RepoName,
+
+        [Parameter(Mandatory = $false)]
+        [string]$Description = "",
+
+        [Parameter(Mandatory = $false)]
+        [ValidateSet("private", "public", "internal")]
+        [string]$Visibility = "private",
+
+        [Parameter(Mandatory = $true)]
+        [string]$OwnerType
+    )
+
+    $isOrg = ($OwnerType -eq "Organization")
+
+    if ($Visibility -eq "internal" -and -not $isOrg) {
+        throw [System.ArgumentException]::new("Visibility 'internal' is only available for organisation repositories on GitHub Enterprise Cloud. Target owner resolved as '$OwnerType'.")
+    }
+
+    $payload = @{
+        name        = $RepoName
+        description = $Description
+        private     = ($Visibility -ne "public")
+        auto_init   = $false
+    }
+
+    # Only organisations accept the explicit visibility field.
+    if ($isOrg) {
+        $payload.visibility = $Visibility
+    }
+
+    return $payload
+}
+
 function New-GitHubRemoteRepository {
     [CmdletBinding()]
     param (
@@ -309,7 +356,8 @@ function New-GitHubRemoteRepository {
         [string]$Description = "",
 
         [Parameter(Mandatory = $false)]
-        [bool]$IsPrivate = $true
+        [ValidateSet("private", "public", "internal")]
+        [string]$Visibility = "private"
     )
 
     $isOrg = ($OwnerType -eq "Organization")
@@ -320,12 +368,7 @@ function New-GitHubRemoteRepository {
         "https://api.github.com/user/repos"
     }
 
-    $payload = @{
-        name        = $RepoName
-        description = $Description
-        private     = $IsPrivate
-        auto_init   = $false
-    }
+    $payload = Get-NewRepositoryPayload -RepoName $RepoName -Description $Description -Visibility $Visibility -OwnerType $OwnerType
 
     try {
         $created = Invoke-GitHubRestRequest -Uri $uri -Token $Token -Method "POST" -Body $payload
@@ -350,5 +393,6 @@ Export-ModuleMember -Function @(
     "Get-GitHubCurrentUser",
     "Get-GitHubOwnerType",
     "Get-GitHubRepoDetails",
+    "Get-NewRepositoryPayload",
     "New-GitHubRemoteRepository"
 )

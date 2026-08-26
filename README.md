@@ -125,6 +125,42 @@ The release manager automatically checks for GitHub authentication credentials i
 
 ---
 
+## Targeting a GitHub Organisation
+
+Set `-TargetOwner` to the organisation login. The owner type is resolved before anything is created: an organisation resolves via `GET /orgs/{owner}` and repositories are created with `POST /orgs/{owner}/repos`, whereas a user account uses `POST /user/repos`.
+
+```powershell
+.\Invoke-CloudflareLandingZoneRelease.ps1 `
+    -TargetOwner "your-organisation" `
+    -GitHubToken $env:GITHUB_TOKEN `
+    -UseUpstreamSource `
+    -Visibility "private"
+```
+
+Confirm the resolution line in the output before letting a run proceed:
+
+```
+[INFO] Target owner 'your-organisation' resolved as: Organization.
+```
+
+If the owner cannot be resolved, the run **fails before creating anything** rather than assuming a user account. Assuming would place every repository under the authenticated account while still reporting success, which is precisely what happens when an organisation enforcing SAML SSO returns 403 to an unauthorised token.
+
+### Token requirements for organisations
+
+| Token type | Requirement |
+| :--- | :--- |
+| Classic PAT | `repo` scope. If the organisation enforces SAML SSO, the token must additionally be **authorised for that organisation** in your token settings |
+| Fine-grained PAT | Resource owner must be **the organisation**, with *Administration: Read and write* to create repositories and *Contents: Read and write* to push |
+| `gh` CLI fallback | Often lacks organisation scopes. Run `gh auth refresh -s admin:org` if relying on it |
+
+The account must also hold repository-creation permission in the organisation. Some organisations restrict this to owners.
+
+### Internal visibility
+
+`-Visibility internal` requires an organisation on GitHub Enterprise Cloud. It is sent as an explicit `visibility` field, because sending only `private = true` would quietly create an ordinary private repository instead. Requesting `internal` against a user account is rejected up front rather than silently downgraded.
+
+---
+
 ## Usage Examples
 
 ### 1. Interactive Wizard Mode
