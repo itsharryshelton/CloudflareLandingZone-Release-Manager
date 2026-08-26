@@ -1,0 +1,14 @@
+# Local staging directories
+.staging/
+staging/
+cflz-release-staging/
+
+# Local sensitive configuration overrides
+*.local.json
+my-release-config.json
+
+# OS & Editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

@@ -1,0 +1,37 @@
+Cloudflare Landing Zone Release Manager
+Copyright 2026 Harry Shelton
+
+This product includes software developed as a Terraform template for managing
+Cloudflare at fleet scale.
+
+Licensed under the Apache License, Version 2.0. See the LICENSE file for the
+full terms.
+
+--------------------------------------------------------------------------------
+
+Third-party components
+
+This repository contains no vendored third-party source. It declares the
+following dependencies, which are obtained at build time and carry their own
+licences:
+
+  Terraform
+    Versions 1.6 and later are licensed under the Business Source License 1.1,
+    with IBM as licensor following its acquisition of HashiCorp. This is not an
+    OSI-approved open source licence. This repository does not distribute
+    Terraform; the pipeline downloads an official release at run time, and the
+    layers require version 1.11 or newer.
+    https://github.com/hashicorp/terraform/blob/main/LICENSE
+
+  terraform-provider-cloudflare (Cloudflare, Inc.)
+    Apache License 2.0. Downloaded from the Terraform Registry at init time and
+    not redistributed here.
+    https://github.com/cloudflare/terraform-provider-cloudflare/blob/main/LICENSE
+
+  TFLint (terraform-linters)
+    Mozilla Public License 2.0. Used in CI only, and not part of anything this
+    repository deploys.
+    https://github.com/terraform-linters/tflint/blob/master/LICENSE
+
+The GitHub Actions referenced by the workflows in .github/workflows/ are
+likewise fetched at run time under their own licences.

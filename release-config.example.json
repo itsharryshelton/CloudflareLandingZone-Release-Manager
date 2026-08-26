@@ -1,0 +1,20 @@
+{
+  "SourceRoot": "D:\\Git\\CloudflareLandingZone\\CloudflareLandingZone",
+  "UseUpstreamSource": false,
+  "UpstreamRepoUrl": "https://github.com/itsharryshelton/CloudflareLandingZone.git",
+  "UpstreamRef": "main",
+  "Prefix": "cflz",
+  "DeploymentRepoName": "{prefix}-deployment",
+  "ModuleRepoPattern": "terraform-cloudflare-lz-{module}",
+  "Visibility": "private",
+  "DefaultBranch": "main",
+  "TargetOwner": "your-github-organisation-or-username",
+  "OwnerType": "Auto",
+  "InitialCommitMsg": "Initial release of Cloudflare Landing Zone component",
+  "UpdateCommitMsg": "Update Cloudflare Landing Zone component release",
+  "IncludeModules": [
+    "All"
+  ],
+  "ExcludeModules": [],
+  "CleanStagingOnExit": true
+}
