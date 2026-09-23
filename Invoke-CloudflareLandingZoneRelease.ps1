@@ -53,6 +53,10 @@
     Publishes module repositories without the CI scaffold under 'templates/module' (fmt, validate,
     offline plan, secret scan and SemVer tagging). Because module repositories are strict mirrors,
     this also removes previously published workflows on the next release.
+.PARAMETER SkipAgentFiles
+    Publishes repositories without the AGENTS.md / CLAUDE.md agent context files under
+    'templates/agents'. The deployment repository receives 'templates/agents/deployment' and every
+    module repository receives 'templates/agents/module'.
 .PARAMETER ConfigFile
     Path to a JSON configuration file to load settings from.
 .PARAMETER SaveConfig
@@ -135,6 +139,9 @@ param (
     [switch]$SkipModuleCI,
 
     [Parameter(Mandatory = $false)]
+    [switch]$SkipAgentFiles,
+
+    [Parameter(Mandatory = $false)]
     [string]$ConfigFile,
 
     [Parameter(Mandatory = $false)]
@@ -183,6 +190,7 @@ if (-not [string]::IsNullOrWhiteSpace($UpstreamRepoUrl)) { $config.UpstreamRepoU
 if (-not [string]::IsNullOrWhiteSpace($UpstreamRef)) { $config.UpstreamRef = $UpstreamRef }
 if ($UseUpstreamSource.IsPresent) { $config.UseUpstreamSource = $true }
 if ($SkipModuleCI.IsPresent) { $config.IncludeModuleCI = $false }
+if ($SkipAgentFiles.IsPresent) { $config.IncludeAgentFiles = $false }
 if ($Modules.Count -gt 0) { $config.IncludeModules = $Modules }
 if ($ExcludeModules.Count -gt 0) { $config.ExcludeModules = $ExcludeModules }
 
@@ -194,6 +202,21 @@ $stagingRoot = $config.StagingDirectory
 $moduleScaffoldDir = Join-Path -Path $PSScriptRoot -ChildPath "templates\module"
 if ($config.IncludeModuleCI -and -not (Test-Path -Path $moduleScaffoldDir)) {
     throw [System.IO.DirectoryNotFoundException]::new("Module CI scaffold not found at '$moduleScaffoldDir'. Restore it, or pass -SkipModuleCI.")
+}
+
+# The deployment repository and the module repositories need different agent guidance,
+# so each component type has its own template set.
+$agentTemplatesRoot = Join-Path -Path $PSScriptRoot -ChildPath "templates\agents"
+$agentTemplateDirs = @{
+    Deployment = Join-Path -Path $agentTemplatesRoot -ChildPath "deployment"
+    Module     = Join-Path -Path $agentTemplatesRoot -ChildPath "module"
+}
+if ($config.IncludeAgentFiles) {
+    foreach ($dir in $agentTemplateDirs.Values) {
+        if (-not (Test-Path -Path $dir)) {
+            throw [System.IO.DirectoryNotFoundException]::new("Agent file templates not found at '$dir'. Restore them, or pass -SkipAgentFiles.")
+        }
+    }
 }
 
 # 2. Resolve GitHub Credentials
@@ -352,6 +375,7 @@ foreach ($item in $releasePlan) {
 Write-Host ("-" * 108) -ForegroundColor DarkGray
 Write-ReleaseInfo "Source: $($config.SourceRoot)"
 Write-ReleaseInfo "Module CI scaffold: $(if ($config.IncludeModuleCI) { "included from '$moduleScaffoldDir'" } else { 'skipped' })"
+Write-ReleaseInfo "Agent files (AGENTS.md / CLAUDE.md): $(if ($config.IncludeAgentFiles) { "included from '$agentTemplatesRoot'" } else { 'skipped' })"
 Write-ReleaseInfo "Total repositories to release: $(@($releasePlan).Count)"
 
 # Optional Save Configuration
@@ -492,6 +516,15 @@ foreach ($planItem in $releasePlan) {
             Write-ReleaseInfo "Added $($scaffoldResult.FileCount) CI scaffold files."
             foreach ($kept in $scaffoldResult.KeptFromSource) {
                 Write-ReleaseWarning "Module ships its own '$kept'; the scaffold copy was not applied."
+            }
+        }
+
+        if ($config.IncludeAgentFiles) {
+            $agentResult = Copy-ComponentScaffold -ScaffoldDirectory $agentTemplateDirs[$planItem.ComponentType] -DestinationDirectory $itemStagingDir
+            $itemResult.FileCount += $agentResult.FileCount
+            Write-ReleaseInfo "Added $($agentResult.FileCount) agent context files."
+            foreach ($kept in $agentResult.KeptFromSource) {
+                Write-ReleaseWarning "$($planItem.ComponentType) ships its own '$kept'; the agent template was not applied."
             }
         }
 

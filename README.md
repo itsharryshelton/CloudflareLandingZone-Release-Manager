@@ -108,6 +108,28 @@ A module cannot be planned without input values. The offline plan uses each `exa
 
 ---
 
+## Agent Context Files
+
+Every published repository receives an `AGENTS.md` and a `CLAUDE.md` from [templates/agents](templates/agents), so coding agents working in it start with the right guidance:
+
+| Template | Published to |
+| :--- | :--- |
+| [templates/agents/deployment](templates/agents/deployment) | The deployment repository |
+| [templates/agents/module](templates/agents/module) | Every module repository (the same pair for all of them) |
+
+`AGENTS.md` holds the guidance. `CLAUDE.md` contains only `@AGENTS.md`, which Claude Code resolves as an import, so both tools read one source and the two files cannot drift apart. This matches the upstream Landing Zone repository.
+
+How updates reach published repositories follows the [re-run behaviour](#re-run-behaviour) of each component type:
+
+- **Modules** receive the templates on every release. Editing `templates/agents/module` updates every module repository on the next run, and edits made directly to `AGENTS.md` / `CLAUDE.md` in a published module repository are reverted.
+- **The deployment repository** receives the templates only when it is first seeded, or re-released with `-ForceDeploymentUpdate`. Operators can then tailor its `AGENTS.md` in place (customer name, active products) without it being overwritten.
+- A component that ships its own `AGENTS.md` or `CLAUDE.md` at source keeps it; the template copy is skipped and a warning is printed.
+- `-SkipAgentFiles`, or `"IncludeAgentFiles": false`, publishes without them. For modules this also removes previously published agent files on the next release.
+
+These files are instructions that agents act on, and they are pushed to every repository the tool publishes. Review changes to the templates as you would review code. Never put tokens or other secrets in them, and keep the module template customer-agnostic: it reaches every module repository, including any published with `-Visibility public`.
+
+---
+
 ## Re-run Behaviour
 
 Re-running against the same GitHub account is safe and idempotent, but the two component types deliberately behave differently.
@@ -299,6 +321,7 @@ Save current settings to a new configuration file:
 | `-ForceDeploymentUpdate` | Switch | `false` | Re-releases an already-seeded deployment repository, overwriting operator edits under `accounts/**`. |
 | `-AllowForcePush` | Switch | `false` | Permits overwriting remote history. Without it, a target repository carrying unrelated commits is reported as failed rather than overwritten. |
 | `-SkipModuleCI` | Switch | `false` | Publishes module repositories without the CI scaffold. See [Module CI and Versioning](#module-ci-and-versioning). |
+| `-SkipAgentFiles` | Switch | `false` | Publishes repositories without `AGENTS.md` / `CLAUDE.md`. See [Agent Context Files](#agent-context-files). |
 | `-ConfigFile` | String | `$null` | Path to JSON configuration file. |
 | `-SaveConfig` | String | `$null` | Path to export current configuration JSON. |
 | `-Interactive` | Switch | `false` | Activates interactive console wizard. |
