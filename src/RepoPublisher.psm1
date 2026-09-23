@@ -192,6 +192,60 @@ function Copy-SourceDataAsIs {
     }
 }
 
+function Copy-ComponentScaffold {
+    <#
+    .SYNOPSIS
+        Overlays a scaffold (CI workflows, scanner configuration) onto a staged release.
+    .DESCRIPTION
+        Module repositories are strict mirrors: anything added directly to one is deleted on the
+        next release. CI therefore has to arrive with every release rather than be added to the
+        published repository afterwards.
+
+        A file the source component already carries wins over the scaffold, so an individual
+        module can ship its own workflow without the scaffold silently replacing it.
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$ScaffoldDirectory,
+
+        [Parameter(Mandatory = $true)]
+        [string]$DestinationDirectory
+    )
+
+    if (-not (Test-Path -Path $ScaffoldDirectory)) {
+        throw [System.IO.DirectoryNotFoundException]::new("Scaffold directory does not exist: $ScaffoldDirectory")
+    }
+
+    $resolvedScaffold = (Resolve-Path -Path $ScaffoldDirectory).ProviderPath.TrimEnd('\', '/')
+    $addedFiles = @()
+    $keptFiles = @()
+
+    foreach ($file in (Get-ChildItem -Path $resolvedScaffold -Recurse -Force -File)) {
+        $relPath = $file.FullName.Substring($resolvedScaffold.Length).TrimStart('\', '/')
+        $destPath = Join-Path -Path $DestinationDirectory -ChildPath $relPath
+
+        if (Test-Path -Path $destPath) {
+            $keptFiles += $relPath
+            continue
+        }
+
+        $destParent = Split-Path -Path $destPath -Parent
+        if (-not (Test-Path -Path $destParent)) {
+            New-Item -Path $destParent -ItemType Directory -Force | Out-Null
+        }
+        Copy-Item -Path $file.FullName -Destination $destPath -Force
+        $addedFiles += $relPath
+    }
+
+    return [PSCustomObject]@{
+        ScaffoldDirectory = $resolvedScaffold
+        FileCount         = $addedFiles.Count
+        Files             = $addedFiles
+        KeptFromSource    = $keptFiles
+    }
+}
+
 function Protect-GitOutput {
     <#
     .SYNOPSIS
@@ -551,7 +605,12 @@ function Publish-LocalRepository {
 
     $pushRes = Invoke-GitCommand -WorkingDirectory $StagingPath -Arguments $pushArgs
     if ($pushRes.ExitCode -ne 0) {
-        $hint = if (-not $AllowForcePush.IsPresent -and $pushRes.Error -match "non-fast-forward|fetch first|rejected") {
+        # GitHub refuses a push that adds or changes .github/workflows/* unless the token carries
+        # the 'workflow' scope, and its message does not say which setting to change.
+        $hint = if ($pushRes.Error -match "workflow.*scope|without .workflow.") {
+            " The release includes GitHub Actions workflows: a classic PAT needs the 'workflow' scope, and a fine-grained PAT needs 'Workflows: Read and write'."
+        }
+        elseif (-not $AllowForcePush.IsPresent -and $pushRes.Error -match "non-fast-forward|fetch first|rejected") {
             " The remote carries commits that are not present locally. Re-run with -AllowForcePush only if overwriting the remote history is intended."
         }
         else {
@@ -571,6 +630,7 @@ function Publish-LocalRepository {
 
 Export-ModuleMember -Function @(
     "Copy-SourceDataAsIs",
+    "Copy-ComponentScaffold",
     "Sync-UpstreamSource",
     "Get-ComponentReleaseAction",
     "Initialize-StagingRepository",

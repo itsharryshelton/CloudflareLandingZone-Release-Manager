@@ -64,6 +64,50 @@ Or override either template outright:
 
 ---
 
+## Module CI and Versioning
+
+Every module repository is published with a CI scaffold from [templates/module](templates/module), adapted from the upstream Landing Zone pipelines:
+
+| File | Purpose |
+| :--- | :--- |
+| `.github/workflows/ci.yml` | `terraform fmt`, `terraform init` / `validate`, offline `terraform plan`, and the release tag |
+| `.github/workflows/secret-scanning.yml` | betterleaks plus the strict Cloudflare token-prefix guard. Called from `ci.yml` so the tag depends on it |
+| `.github/scripts/next-version.sh` | Works out the next SemVer tag |
+| `.betterleaks.toml` | Scanner rules, matching upstream |
+
+The checks run on every pull request and every push to `main`. When all of them pass on a push to `main`, the commit is tagged.
+
+### Version keywords
+
+The bump is read from **every commit since the last tag**, not only the head commit, so a keyword anywhere in a multi-commit push or a merged pull request counts. The highest keyword wins.
+
+| Commit message contains | `v1.0.0` becomes |
+| :--- | :--- |
+| `#major` | `v2.0.0` |
+| `#minor` | `v1.1.0` |
+| `#patch`, or no keyword | `v1.0.1` |
+
+The first release of a repository is always `v1.0.0`. Keywords are case-insensitive and must stand alone, so `#minor-fix` or `#majority` do not match. Only strict `vX.Y.Z` tags are considered, and a commit that is already tagged is not tagged again.
+
+Commits made by this tool use `InitialCommitMsg` / `UpdateCommitMsg`, which carry no keyword and so bump the patch version. To publish a release as a minor or major version, put the keyword in `UpdateCommitMsg` in a configuration file for that run.
+
+### Offline plan fixtures
+
+A module cannot be planned without input values. The offline plan uses each `examples/<name>/` directory as a fixture: a root module calling `source = "../.."` with representative inputs. `*.tfvars` files in an example are passed as `-var-file` (`terraform.tfvars` is never committable in a module repository). Without examples the module root is planned directly, which only succeeds when every variable has a default; otherwise the job warns and passes rather than failing. A module that declares a `data "cloudflare_*"` source is skipped, because it reads the API at plan time.
+
+### Opting out and overriding
+
+- `-SkipModuleCI`, or `"IncludeModuleCI": false`, publishes modules without the scaffold. Because module repositories are mirrors, this also removes previously published workflows on the next release.
+- A module that ships its own file at the same path (for example `modules/waf/.github/workflows/ci.yml` upstream) keeps it; the scaffold copy is skipped and a warning is printed.
+- Edits made directly to the workflows in a published module repository are reverted on the next release. Change `templates/module` here instead.
+
+### Repository settings the tag job needs
+
+- The job pushes tags with `GITHUB_TOKEN` and `contents: write`. If the organisation restricts workflow permissions to read-only at the organisation level, the tag push fails until that is relaxed for these repositories.
+- A tag ruleset protecting `v*` blocks the push unless GitHub Actions is on its bypass list.
+
+---
+
 ## Re-run Behaviour
 
 Re-running against the same GitHub account is safe and idempotent, but the two component types deliberately behave differently.
@@ -110,7 +154,7 @@ Set `"SeedDeploymentOnce": false` in a configuration file to make the deployment
 
 1. **PowerShell 7+** (`pwsh`).
 2. **Git** (installed and present in `PATH`).
-3. **GitHub Personal Access Token (PAT)** with `repo` permissions (or authenticated `gh` CLI).
+3. **GitHub Personal Access Token (PAT)** with `repo` and `workflow` permissions (or authenticated `gh` CLI). `workflow` is needed because module repositories are published with GitHub Actions workflows; without it GitHub rejects the push.
 
 ---
 
@@ -149,8 +193,8 @@ If the owner cannot be resolved, the run **fails before creating anything** rath
 
 | Token type | Requirement |
 | :--- | :--- |
-| Classic PAT | `repo` scope. If the organisation enforces SAML SSO, the token must additionally be **authorised for that organisation** in your token settings |
-| Fine-grained PAT | Resource owner must be **the organisation**, with *Administration: Read and write* to create repositories and *Contents: Read and write* to push |
+| Classic PAT | `repo` and `workflow` scopes. If the organisation enforces SAML SSO, the token must additionally be **authorised for that organisation** in your token settings |
+| Fine-grained PAT | Resource owner must be **the organisation**, with *Administration: Read and write* to create repositories, *Contents: Read and write* to push, and *Workflows: Read and write* to publish the module CI |
 | `gh` CLI fallback | Often lacks organisation scopes. Run `gh auth refresh -s admin:org` if relying on it |
 
 The account must also hold repository-creation permission in the organisation. Some organisations restrict this to owners.
@@ -254,6 +298,7 @@ Save current settings to a new configuration file:
 | `-OnlyModules` | Switch | `false` | When set, only processes modules. |
 | `-ForceDeploymentUpdate` | Switch | `false` | Re-releases an already-seeded deployment repository, overwriting operator edits under `accounts/**`. |
 | `-AllowForcePush` | Switch | `false` | Permits overwriting remote history. Without it, a target repository carrying unrelated commits is reported as failed rather than overwritten. |
+| `-SkipModuleCI` | Switch | `false` | Publishes module repositories without the CI scaffold. See [Module CI and Versioning](#module-ci-and-versioning). |
 | `-ConfigFile` | String | `$null` | Path to JSON configuration file. |
 | `-SaveConfig` | String | `$null` | Path to export current configuration JSON. |
 | `-Interactive` | Switch | `false` | Activates interactive console wizard. |

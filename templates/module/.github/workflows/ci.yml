@@ -1,0 +1,228 @@
+# CI - correctness checks for a single Cloudflare Landing Zone module. Needs no
+# credentials and touches no Cloudflare account. A green push to main is tagged
+# with the next SemVer version, driven by #major / #minor / #patch in the commits.
+#
+# Injected by the Cloudflare Landing Zone Release Manager. Module repositories are
+# strict mirrors, so an edit made here is reverted on the next release - change
+# templates/module in the Release Manager instead.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # Every push to main is a release candidate. Cancelling one mid-run would drop
+  # its version keyword on the floor, so only superseded PR runs are cancelled.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  TF_VERSION: '1.14.6'
+  TF_IN_AUTOMATION: '1'
+  TF_INPUT: '0'
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ---------------------------------------------------------------------------
+  fmt:
+    name: terraform fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+      - run: terraform fmt -check -recursive -diff
+
+  # ---------------------------------------------------------------------------
+  validate:
+    name: terraform init / validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Validate the module and every example
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          failed=()
+
+          # A child module validates standalone: it declares required_providers and
+          # owns no backend, so init needs nothing but the public registry. Each
+          # examples/<name> is a root module consuming this one via source = "../..".
+          dirs=(.)
+          for d in examples/*/; do dirs+=("${d%/}"); done
+
+          for dir in "${dirs[@]}"; do
+            echo "::group::validate $dir"
+            if ! (terraform -chdir="$dir" init -backend=false -input=false \
+                  && terraform -chdir="$dir" validate); then
+              failed+=("$dir")
+            fi
+            echo "::endgroup::"
+          done
+
+          # Every directory is reported, not just the first to break.
+          if [[ ${#failed[@]} -gt 0 ]]; then
+            printf '::error::validate failed: %s\n' "${failed[@]}"
+            exit 1
+          fi
+
+  # ---------------------------------------------------------------------------
+  # An offline plan is the strongest check available without a live account: it
+  # evaluates every expression, for_each and validation block against real input
+  # values. It needs input values to plan with, which is what examples/ provides.
+  offline-plan:
+    name: terraform plan (offline)
+    runs-on: ubuntu-latest
+    env:
+      # Every resource in an offline plan is a create, so the provider is never
+      # asked to call the Cloudflare API and this value is never used.
+      CLOUDFLARE_API_TOKEN: 'offline-plan-no-api-calls'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Plan the module offline
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          # </dev/null: under nullglob a directory with no .tf would otherwise leave
+          # grep reading stdin.
+          reads_api() { grep -hqE '^[[:space:]]*data[[:space:]]+"cloudflare_' "$1"/*.tf </dev/null; }
+
+          # A Cloudflare data source reads the API at plan time, which the dummy
+          # token above cannot do. That is a property of the module, not a failure.
+          if reads_api .; then
+            echo "::notice::module reads the Cloudflare API at plan time; offline plan skipped"
+            echo "### Offline plan skipped: the module declares a \`data \"cloudflare_*\"\` source." >>"$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # Examples are the plan fixtures. Without any, the module root is planned
+          # directly, which only succeeds when every variable has a default.
+          targets=()
+          for d in examples/*/; do targets+=("${d%/}"); done
+          [[ ${#targets[@]} -gt 0 ]] || targets=(.)
+
+          planned=0
+          skipped=()
+          failed=()
+
+          for dir in "${targets[@]}"; do
+            if [[ "$dir" != "." ]] && reads_api "$dir"; then
+              skipped+=("$dir (reads the Cloudflare API)")
+              continue
+            fi
+
+            # terraform.tfvars is never committable in a module repository, so an
+            # example's values arrive as explicit var files. *.auto.tfvars loads itself.
+            varfiles=()
+            for f in "$dir"/*.tfvars; do
+              case "$f" in *.auto.tfvars) continue ;; esac
+              varfiles+=("-var-file=$(basename "$f")")
+            done
+
+            echo "::group::init $dir"
+            terraform -chdir="$dir" init -input=false
+            echo "::endgroup::"
+
+            # Output is captured, not streamed: nobody reads it on a green run.
+            # -refresh=false and -lock=false: there is no state and no backend.
+            if terraform -chdir="$dir" plan -input=false -lock=false -refresh=false \
+                 -compact-warnings "${varfiles[@]}" >plan.log 2>&1; then
+              printf 'ok   %-24s %s\n' "$dir" "$(grep -E '^Plan:|^No changes' plan.log | tail -n1)"
+              planned=$((planned + 1))
+            elif [[ "$dir" == "." ]] && grep -q 'No value for required variable' plan.log; then
+              # Not a defect in the module - there is simply nothing to plan it with.
+              skipped+=(". (required variables and no examples/ fixture)")
+            else
+              echo "::group::plan $dir FAILED"
+              cat plan.log
+              echo "::endgroup::"
+              failed+=("$dir")
+            fi
+          done
+
+          {
+            echo "### Offline plans: $planned"
+            echo
+            for s in "${skipped[@]}"; do echo "- skipped: \`$s\`"; done
+            if [[ $planned -eq 0 ]]; then
+              echo
+              echo "_Nothing was planned. Add an \`examples/<name>/\` root module calling"
+              echo "\`source = \"../..\"\` with representative inputs to enable this check._"
+            fi
+          } >>"$GITHUB_STEP_SUMMARY"
+
+          if [[ $planned -eq 0 ]]; then
+            echo "::warning::no offline plan ran - add an examples/<name> fixture to enable this check"
+          fi
+
+          if [[ ${#failed[@]} -gt 0 ]]; then
+            printf '::error::offline plan failed: %s\n' "${failed[@]}"
+            exit 1
+          fi
+
+      - name: Remove plan leftovers
+        if: always()
+        run: rm -f plan.log
+
+  # ---------------------------------------------------------------------------
+  # Called rather than triggered separately, so the release tag can depend on it.
+  secret-scan:
+    name: secret scan
+    uses: ./.github/workflows/secret-scanning.yml
+
+  # ---------------------------------------------------------------------------
+  release-tag:
+    name: publish version tag
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [fmt, validate, offline-plan, secret-scan]
+    permissions:
+      contents: write
+    # Two pushes landing close together must not both read the same latest tag
+    # and race to create the same next one.
+    concurrency:
+      group: release-tag-${{ github.repository }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Compute and push the next version tag
+        run: |
+          set -euo pipefail
+          git fetch --tags --force --quiet
+
+          next="$(bash .github/scripts/next-version.sh)"
+          if [[ -z "$next" ]]; then
+            echo "### HEAD is already tagged; no new version" >>"$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$next" -m "Release $next"
+          git push origin "refs/tags/$next"
+          echo "### Tagged \`$next\`" >>"$GITHUB_STEP_SUMMARY"
