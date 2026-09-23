@@ -195,7 +195,7 @@ function Copy-SourceDataAsIs {
 function Copy-ComponentScaffold {
     <#
     .SYNOPSIS
-        Overlays a scaffold (CI workflows, scanner configuration) onto a staged release.
+        Overlays a scaffold (CI workflows, scanner configuration, agent context files) onto a staged release.
     .DESCRIPTION
         Module repositories are strict mirrors: anything added directly to one is deleted on the
         next release. CI therefore has to arrive with every release rather than be added to the

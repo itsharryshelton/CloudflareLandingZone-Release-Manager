@@ -303,6 +303,60 @@ Describe "Module CI Scaffold" {
     }
 }
 
+Describe "Agent Context Files" {
+    BeforeAll {
+        $script:agentTemplates = Join-Path -Path (Split-Path -Path $PSScriptRoot -Parent) -ChildPath "templates\agents"
+    }
+
+    Context "Shipped templates" {
+        It "Should carry AGENTS.md and CLAUDE.md for the <Type> template" -ForEach @(
+            @{ Type = "deployment" }
+            @{ Type = "module" }
+        ) {
+            Test-Path -Path (Join-Path $script:agentTemplates "$Type\AGENTS.md") | Should -Be $true
+            Test-Path -Path (Join-Path $script:agentTemplates "$Type\CLAUDE.md") | Should -Be $true
+        }
+
+        It "Should give the deployment repository different guidance to the modules" {
+            $deployment = Get-Content -Path (Join-Path $script:agentTemplates "deployment\AGENTS.md") -Raw
+            $module = Get-Content -Path (Join-Path $script:agentTemplates "module\AGENTS.md") -Raw
+            $deployment | Should -Not -Be $module
+        }
+    }
+
+    Context "Overlay onto a staged release" {
+        It "Should add both agent files alongside the source" {
+            $dest = New-TestWorkspace
+            try {
+                Set-Content -Path (Join-Path $dest "main.tf") -Value "resource test {}"
+                $result = Copy-ComponentScaffold -ScaffoldDirectory (Join-Path $script:agentTemplates "module") -DestinationDirectory $dest
+
+                $result.FileCount | Should -Be 2
+                Test-Path -Path (Join-Path $dest "AGENTS.md") | Should -Be $true
+                Test-Path -Path (Join-Path $dest "CLAUDE.md") | Should -Be $true
+            }
+            finally {
+                if (Test-Path -Path $dest) { Remove-Item -Path $dest -Recurse -Force }
+            }
+        }
+
+        It "Should keep an AGENTS.md the component already ships" {
+            $dest = New-TestWorkspace
+            try {
+                Set-Content -Path (Join-Path $dest "AGENTS.md") -Value "component-own"
+                $result = Copy-ComponentScaffold -ScaffoldDirectory (Join-Path $script:agentTemplates "deployment") -DestinationDirectory $dest
+
+                (Get-Content -Path (Join-Path $dest "AGENTS.md") -Raw).Trim() | Should -Be "component-own"
+                $result.KeptFromSource | Should -Contain "AGENTS.md"
+                $result.Files | Should -Contain "CLAUDE.md"
+            }
+            finally {
+                if (Test-Path -Path $dest) { Remove-Item -Path $dest -Recurse -Force }
+            }
+        }
+    }
+}
+
 Describe "Publishing Mechanics" {
     Context "Publish-LocalRepository against a local bare remote" {
         BeforeEach {
