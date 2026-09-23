@@ -6,6 +6,7 @@
   "Prefix": "cflz",
   "DeploymentRepoName": "{prefix}-deployment",
   "ModuleRepoPattern": "terraform-cloudflare-lz-{module}",
+  "IncludeModuleCI": true,
   "Visibility": "private",
   "DefaultBranch": "main",
   "TargetOwner": "your-github-organisation-or-username",

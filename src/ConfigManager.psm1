@@ -30,6 +30,7 @@ function Get-ReleaseDefaultConfig {
         DeploymentRepoName  = "{prefix}-deployment"
         ModuleRepoPattern   = "terraform-cloudflare-lz-{module}"
         SeedDeploymentOnce  = $true
+        IncludeModuleCI     = $true
         Visibility          = "private"
         DefaultBranch       = "main"
         TargetOwner         = ""
@@ -150,6 +151,7 @@ function Export-ReleaseConfigFile {
         DeploymentRepoName = $Config.DeploymentRepoName
         ModuleRepoPattern  = $Config.ModuleRepoPattern
         SeedDeploymentOnce = $Config.SeedDeploymentOnce
+        IncludeModuleCI    = $Config.IncludeModuleCI
         Visibility         = $Config.Visibility
         DefaultBranch      = $Config.DefaultBranch
         TargetOwner        = $Config.TargetOwner

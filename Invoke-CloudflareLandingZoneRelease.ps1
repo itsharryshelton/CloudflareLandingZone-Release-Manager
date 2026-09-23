@@ -49,6 +49,10 @@
 .PARAMETER AllowForcePush
     Permits overwriting remote history when a target repository already carries unrelated commits.
     Without this switch such a repository is reported as failed rather than being overwritten.
+.PARAMETER SkipModuleCI
+    Publishes module repositories without the CI scaffold under 'templates/module' (fmt, validate,
+    offline plan, secret scan and SemVer tagging). Because module repositories are strict mirrors,
+    this also removes previously published workflows on the next release.
 .PARAMETER ConfigFile
     Path to a JSON configuration file to load settings from.
 .PARAMETER SaveConfig
@@ -128,6 +132,9 @@ param (
     [switch]$AllowForcePush,
 
     [Parameter(Mandatory = $false)]
+    [switch]$SkipModuleCI,
+
+    [Parameter(Mandatory = $false)]
     [string]$ConfigFile,
 
     [Parameter(Mandatory = $false)]
@@ -175,18 +182,26 @@ if (-not [string]::IsNullOrWhiteSpace($Visibility)) { $config.Visibility = $Visi
 if (-not [string]::IsNullOrWhiteSpace($UpstreamRepoUrl)) { $config.UpstreamRepoUrl = $UpstreamRepoUrl }
 if (-not [string]::IsNullOrWhiteSpace($UpstreamRef)) { $config.UpstreamRef = $UpstreamRef }
 if ($UseUpstreamSource.IsPresent) { $config.UseUpstreamSource = $true }
+if ($SkipModuleCI.IsPresent) { $config.IncludeModuleCI = $false }
 if ($Modules.Count -gt 0) { $config.IncludeModules = $Modules }
 if ($ExcludeModules.Count -gt 0) { $config.ExcludeModules = $ExcludeModules }
 
 $isDryRun = $DryRun.IsPresent -or $WhatIfPreference
 $stagingRoot = $config.StagingDirectory
 
+# Checked up front: discovering a missing scaffold mid-run would leave some module
+# repositories published with CI and some without.
+$moduleScaffoldDir = Join-Path -Path $PSScriptRoot -ChildPath "templates\module"
+if ($config.IncludeModuleCI -and -not (Test-Path -Path $moduleScaffoldDir)) {
+    throw [System.IO.DirectoryNotFoundException]::new("Module CI scaffold not found at '$moduleScaffoldDir'. Restore it, or pass -SkipModuleCI.")
+}
+
 # 2. Resolve GitHub Credentials
 $token = Resolve-GitHubToken -ExplicitToken $GitHubToken
 
 if ([string]::IsNullOrWhiteSpace($token) -and ($Interactive.IsPresent -or (-not $isDryRun -and [string]::IsNullOrWhiteSpace($config.TargetOwner)))) {
     Write-SectionHeader -Title "GitHub Authentication Required"
-    Write-ReleaseInfo "A GitHub Personal Access Token (PAT) with 'repo' scope is required to create private repositories."
+    Write-ReleaseInfo "A GitHub Personal Access Token (PAT) with 'repo' and 'workflow' scopes is required to create private repositories and publish module CI."
     $rawToken = Request-UserText -Prompt "Enter GitHub Personal Access Token" -AsSecureString
     $token = Resolve-GitHubToken -ExplicitToken $rawToken
 }
@@ -336,6 +351,7 @@ foreach ($item in $releasePlan) {
 }
 Write-Host ("-" * 108) -ForegroundColor DarkGray
 Write-ReleaseInfo "Source: $($config.SourceRoot)"
+Write-ReleaseInfo "Module CI scaffold: $(if ($config.IncludeModuleCI) { "included from '$moduleScaffoldDir'" } else { 'skipped' })"
 Write-ReleaseInfo "Total repositories to release: $(@($releasePlan).Count)"
 
 # Optional Save Configuration
@@ -469,7 +485,17 @@ foreach ($planItem in $releasePlan) {
             -DestinationDirectory $itemStagingDir `
             -ComponentType $planItem.ComponentType
         $itemResult.FileCount = $copyResult.FileCount
-        Write-ReleaseInfo "Staged $($copyResult.FileCount) files for release."
+
+        if ($planItem.ComponentType -eq "Module" -and $config.IncludeModuleCI) {
+            $scaffoldResult = Copy-ComponentScaffold -ScaffoldDirectory $moduleScaffoldDir -DestinationDirectory $itemStagingDir
+            $itemResult.FileCount += $scaffoldResult.FileCount
+            Write-ReleaseInfo "Added $($scaffoldResult.FileCount) CI scaffold files."
+            foreach ($kept in $scaffoldResult.KeptFromSource) {
+                Write-ReleaseWarning "Module ships its own '$kept'; the scaffold copy was not applied."
+            }
+        }
+
+        Write-ReleaseInfo "Staged $($itemResult.FileCount) files for release."
 
         # D. Commit and Push
         $commitMessage = if ($stagingState.HistoryFetched) { $config.UpdateCommitMsg } else { $config.InitialCommitMsg }

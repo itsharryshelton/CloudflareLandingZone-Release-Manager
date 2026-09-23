@@ -244,6 +244,65 @@ Describe "Source Copy and Filter Logic" {
     }
 }
 
+Describe "Module CI Scaffold" {
+    BeforeAll {
+        $script:moduleScaffold = Join-Path -Path (Split-Path -Path $PSScriptRoot -Parent) -ChildPath "templates\module"
+    }
+
+    Context "Shipped template" {
+        It "Should carry the CI workflow, the secret scan, the tag script and the scanner config" {
+            Test-Path -Path (Join-Path $script:moduleScaffold ".github\workflows\ci.yml") | Should -Be $true
+            Test-Path -Path (Join-Path $script:moduleScaffold ".github\workflows\secret-scanning.yml") | Should -Be $true
+            Test-Path -Path (Join-Path $script:moduleScaffold ".github\scripts\next-version.sh") | Should -Be $true
+            Test-Path -Path (Join-Path $script:moduleScaffold ".betterleaks.toml") | Should -Be $true
+        }
+
+        It "Should gate the release tag on every check" {
+            $ci = Get-Content -Path (Join-Path $script:moduleScaffold ".github\workflows\ci.yml") -Raw
+            $ci | Should -Match "needs: \[fmt, validate, offline-plan, secret-scan\]"
+        }
+    }
+
+    Context "Copy-ComponentScaffold" {
+        It "Should overlay the scaffold onto a staged module" {
+            $dest = New-TestWorkspace
+            try {
+                Set-Content -Path (Join-Path $dest "main.tf") -Value "resource test {}"
+                $result = Copy-ComponentScaffold -ScaffoldDirectory $script:moduleScaffold -DestinationDirectory $dest
+
+                $result.FileCount | Should -Be 4
+                Test-Path -Path (Join-Path $dest ".github\workflows\ci.yml") | Should -Be $true
+                Test-Path -Path (Join-Path $dest "main.tf") | Should -Be $true
+            }
+            finally {
+                if (Test-Path -Path $dest) { Remove-Item -Path $dest -Recurse -Force }
+            }
+        }
+
+        It "Should leave a file the module already ships untouched" {
+            $dest = New-TestWorkspace
+            try {
+                New-Item -Path (Join-Path $dest ".github\workflows") -ItemType Directory -Force | Out-Null
+                Set-Content -Path (Join-Path $dest ".github\workflows\ci.yml") -Value "name: module-own"
+
+                $result = Copy-ComponentScaffold -ScaffoldDirectory $script:moduleScaffold -DestinationDirectory $dest
+
+                (Get-Content -Path (Join-Path $dest ".github\workflows\ci.yml") -Raw).Trim() | Should -Be "name: module-own"
+                $result.KeptFromSource | Should -Contain ".github\workflows\ci.yml"
+                $result.FileCount | Should -Be 3
+            }
+            finally {
+                if (Test-Path -Path $dest) { Remove-Item -Path $dest -Recurse -Force }
+            }
+        }
+
+        It "Should reject a missing scaffold directory" {
+            { Copy-ComponentScaffold -ScaffoldDirectory "Z:\does-not-exist" -DestinationDirectory ([System.IO.Path]::GetTempPath()) } |
+            Should -Throw
+        }
+    }
+}
+
 Describe "Publishing Mechanics" {
     Context "Publish-LocalRepository against a local bare remote" {
         BeforeEach {

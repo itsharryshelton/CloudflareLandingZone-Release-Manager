@@ -1,0 +1,29 @@
+# Betterleaks Secret Scanning Configuration
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "cloudflare-api-token-cfat"
+description = "Cloudflare API or Account Token starting with cfat_ prefix"
+regex = '''(?i)\bcfat_[a-zA-Z0-9_\-]{16,}\b'''
+keywords = ["cfat_"]
+
+[[rules]]
+id = "cloudflare-api-token-prefix"
+description = "Strict match on any Cloudflare API token prefix"
+regex = '''(?i)\bcfat_[a-zA-Z0-9_\-]+\b'''
+keywords = ["cfat_"]
+
+[allowlist]
+description = "Global allowlist for public Terraform identifiers, Entra GUIDs, and account IDs"
+# Suppressed by value, not by path: the secret-scanning workflow once declared a shell
+# variable named after the token prefix, and git history is immutable. A path allowlist
+# would blind the scanner to a genuine token committed to that same workflow.
+stopwords = ["cfat_detected"]
+regexes = [
+  '''(?i)\bcfat_detected\b''',
+  '''(?i)(?:cloudflare_)?account_id\s*=\s*["'][a-f0-9]{32}["']''',
+  '''(?i)zone_id\s*=\s*["'][a-f0-9]{32}["']''',
+  '''(?i)(?:client_id|directory_id|tenant_id|group_id)\s*=\s*["'][0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}["']''',
+]
