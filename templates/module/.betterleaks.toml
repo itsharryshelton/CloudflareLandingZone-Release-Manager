@@ -26,4 +26,8 @@ regexes = [
   '''(?i)(?:cloudflare_)?account_id\s*=\s*["'][a-f0-9]{32}["']''',
   '''(?i)zone_id\s*=\s*["'][a-f0-9]{32}["']''',
   '''(?i)(?:client_id|directory_id|tenant_id|group_id)\s*=\s*["'][0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}["']''',
+  # authenticated_origin_pulls quotes the PEM header twice in its validation error
+  # messages, which the default private-key rule reads as one key block. Matched on the
+  # prose that follows the header: a real key continues with a newline and base64.
+  '''-----BEGIN PRIVATE KEY----- line \(or the RSA/EC variant\)''',
 ]
