@@ -3,9 +3,21 @@
     Automated Release Manager for Cloudflare Landing Zones.
 .DESCRIPTION
     Provisions private GitHub repositories and synchronises source data as-is
-    for the Cloudflare Landing Zone deployment framework and all individual modules.
+    for the Cloudflare Landing Zone management repository and all individual modules.
+
+    By default the orchestration repository is a management repository: the upstream
+    repository root minus 'modules/', so the plan / apply pipelines under '.github/' ship
+    with it and still find 'deployment/layers/*' at the path they expect. Its layers are
+    repointed at the per-module repositories published in the same run, pinned to a tag.
 .PARAMETER SourceRoot
     Path to the root CloudflareLandingZone repository containing 'deployment' and 'modules'.
+.PARAMETER DeploymentLayout
+    'Management' (default) publishes the source root minus 'modules/' as '{prefix}-management'.
+    'Flat' publishes only the 'deployment/' directory, as its own repository root, under
+    -DeploymentRepoName. The flat layout carries no pipelines.
+.PARAMETER ManagementRepoName
+    Name template for the management repository. Supports the '{prefix}' token.
+    Default: '{prefix}-management', which resolves to 'cflz-management'.
 .PARAMETER UseUpstreamSource
     Cuts the release from a fresh shallow clone of the upstream GitHub repository rather than
     from the local working tree, guaranteeing the published content matches what is on GitHub.
@@ -23,8 +35,8 @@
     Short organisation prefix substituted into the '{prefix}' token of a repository name
     template. Default: 'cflz'.
 .PARAMETER DeploymentRepoName
-    Name template for the central deployment repository. Supports the '{prefix}' token.
-    Default: '{prefix}-deployment', which resolves to 'cflz-deployment'.
+    Name template for the flat deployment repository, used when -DeploymentLayout is 'Flat'.
+    Supports the '{prefix}' token. Default: '{prefix}-deployment', which resolves to 'cflz-deployment'.
 .PARAMETER ModuleRepoPattern
     Name template for per-module repositories. Supports the '{prefix}' and '{module}' tokens.
     Default: 'terraform-cloudflare-lz-{module}'.
@@ -32,17 +44,36 @@
     'account_governance' publishes as 'terraform-cloudflare-lz-account-governance'.
 .PARAMETER Visibility
     Repository visibility ('private', 'public', 'internal'). Default: 'private'.
+.PARAMETER GitTransport
+    How Git fetches from and pushes to the target repositories. 'https' (default) authenticates
+    with the token. 'ssh' authenticates with an SSH key; GitHub API calls still use the token.
+    An SSH key is not subject to OAuth scopes, so it can publish workflows where the token
+    lacks the 'workflow' scope.
+.PARAMETER SshKeyPath
+    Private key used when -GitTransport is 'ssh'. Only this key is offered (IdentitiesOnly), and
+    it must not need a passphrase unless it is loaded in ssh-agent. When omitted, ssh's own
+    configuration and agent decide.
 .PARAMETER Modules
     Optional list of specific module names to release. If omitted, all discovered modules are released.
 .PARAMETER ExcludeModules
     Optional list of module names to omit from the release.
 .PARAMETER OnlyDeployment
-    If specified, only creates and synchronises the deployment repository.
+    If specified, only creates and synchronises the orchestration repository (management or
+    flat deployment, per -DeploymentLayout). Alias: -OnlyManagement.
 .PARAMETER OnlyModules
     If specified, only creates and synchronises the module repositories.
+.PARAMETER ModuleSourceRef
+    The ref every repointed module source is pinned to. 'latest' (default) pins each module to
+    the highest vX.Y.Z tag its published repository carries, or 'v1.0.0' - the first tag the
+    module CI publishes - where it has none yet. Any other value is used as-is for every module.
+.PARAMETER SkipSourceRewrite
+    Publishes the orchestration repository with the layers' upstream module sources unchanged.
+    They point at '../../../modules/<module>' or a 'cloudflare-platform-modules' placeholder,
+    neither of which resolves downstream, so the operator must repoint them by hand.
 .PARAMETER ForceDeploymentUpdate
-    Re-releases the deployment repository even though it has already been seeded.
-    By default an existing deployment repository is skipped, because a release wipes and
+    Re-releases the orchestration repository even though it has already been seeded.
+    Alias: -ForceManagementUpdate.
+    By default an existing orchestration repository is skipped, because a release wipes and
     re-copies the working tree, which would revert operator edits under 'accounts/**' and
     delete any account file added there that does not exist upstream. Module repositories
     are unaffected: they carry no per-tenant content and are always re-synchronised.
@@ -55,8 +86,9 @@
     this also removes previously published workflows on the next release.
 .PARAMETER SkipAgentFiles
     Publishes repositories without the AGENTS.md / CLAUDE.md agent context files under
-    'templates/agents'. The deployment repository receives 'templates/agents/deployment' and every
-    module repository receives 'templates/agents/module'.
+    'templates/agents'. The management repository receives 'templates/agents/management', a flat
+    deployment repository 'templates/agents/deployment', and every module repository
+    'templates/agents/module'. A file the source already ships wins over the template.
 .PARAMETER ConfigFile
     Path to a JSON configuration file to load settings from.
 .PARAMETER SaveConfig
@@ -108,6 +140,13 @@ param (
     [string]$Prefix,
 
     [Parameter(Mandatory = $false)]
+    [ValidateSet("Management", "Flat")]
+    [string]$DeploymentLayout,
+
+    [Parameter(Mandatory = $false)]
+    [string]$ManagementRepoName,
+
+    [Parameter(Mandatory = $false)]
     [string]$DeploymentRepoName,
 
     [Parameter(Mandatory = $false)]
@@ -118,18 +157,33 @@ param (
     [string]$Visibility,
 
     [Parameter(Mandatory = $false)]
+    [ValidateSet("https", "ssh")]
+    [string]$GitTransport,
+
+    [Parameter(Mandatory = $false)]
+    [string]$SshKeyPath,
+
+    [Parameter(Mandatory = $false)]
     [string[]]$Modules = @(),
 
     [Parameter(Mandatory = $false)]
     [string[]]$ExcludeModules = @(),
 
     [Parameter(Mandatory = $false)]
+    [Alias("OnlyManagement")]
     [switch]$OnlyDeployment,
 
     [Parameter(Mandatory = $false)]
     [switch]$OnlyModules,
 
     [Parameter(Mandatory = $false)]
+    [string]$ModuleSourceRef,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$SkipSourceRewrite,
+
+    [Parameter(Mandatory = $false)]
+    [Alias("ForceManagementUpdate")]
     [switch]$ForceDeploymentUpdate,
 
     [Parameter(Mandatory = $false)]
@@ -166,6 +220,7 @@ Import-Module (Join-Path -Path $moduleDir -ChildPath "UiHelper.psm1") -Force
 Import-Module (Join-Path -Path $moduleDir -ChildPath "ConfigManager.psm1") -Force
 Import-Module (Join-Path -Path $moduleDir -ChildPath "GitHubApi.psm1") -Force
 Import-Module (Join-Path -Path $moduleDir -ChildPath "RepoPublisher.psm1") -Force
+Import-Module (Join-Path -Path $moduleDir -ChildPath "SourceRewriter.psm1") -Force
 
 Write-ReleaseHeader -Title "Cloudflare Landing Zone - Release Manager" -Subtitle "Automated Private Repository Provisioning and Synchronisation"
 
@@ -183,9 +238,15 @@ if (-not [string]::IsNullOrWhiteSpace($ConfigFile)) {
 if (-not [string]::IsNullOrWhiteSpace($SourceRoot)) { $config.SourceRoot = $SourceRoot }
 if (-not [string]::IsNullOrWhiteSpace($TargetOwner)) { $config.TargetOwner = $TargetOwner }
 if (-not [string]::IsNullOrWhiteSpace($Prefix)) { $config.Prefix = $Prefix }
+if (-not [string]::IsNullOrWhiteSpace($DeploymentLayout)) { $config.DeploymentLayout = $DeploymentLayout }
+if (-not [string]::IsNullOrWhiteSpace($ManagementRepoName)) { $config.ManagementRepoName = $ManagementRepoName }
 if (-not [string]::IsNullOrWhiteSpace($DeploymentRepoName)) { $config.DeploymentRepoName = $DeploymentRepoName }
+if (-not [string]::IsNullOrWhiteSpace($ModuleSourceRef)) { $config.ModuleSourceRef = $ModuleSourceRef }
+if ($SkipSourceRewrite.IsPresent) { $config.RewriteModuleSources = $false }
 if (-not [string]::IsNullOrWhiteSpace($ModuleRepoPattern)) { $config.ModuleRepoPattern = $ModuleRepoPattern }
 if (-not [string]::IsNullOrWhiteSpace($Visibility)) { $config.Visibility = $Visibility }
+if (-not [string]::IsNullOrWhiteSpace($GitTransport)) { $config.GitTransport = $GitTransport }
+if (-not [string]::IsNullOrWhiteSpace($SshKeyPath)) { $config.SshKeyPath = $SshKeyPath }
 if (-not [string]::IsNullOrWhiteSpace($UpstreamRepoUrl)) { $config.UpstreamRepoUrl = $UpstreamRepoUrl }
 if (-not [string]::IsNullOrWhiteSpace($UpstreamRef)) { $config.UpstreamRef = $UpstreamRef }
 if ($UseUpstreamSource.IsPresent) { $config.UseUpstreamSource = $true }
@@ -193,6 +254,26 @@ if ($SkipModuleCI.IsPresent) { $config.IncludeModuleCI = $false }
 if ($SkipAgentFiles.IsPresent) { $config.IncludeAgentFiles = $false }
 if ($Modules.Count -gt 0) { $config.IncludeModules = $Modules }
 if ($ExcludeModules.Count -gt 0) { $config.ExcludeModules = $ExcludeModules }
+
+# A configuration file bypasses the parameter's ValidateSet, so the layout is checked here.
+if ($config.DeploymentLayout -notin @("Management", "Flat")) {
+    throw [System.ArgumentException]::new("DeploymentLayout must be 'Management' or 'Flat', not '$($config.DeploymentLayout)'.")
+}
+$orchestrationType = if ($config.DeploymentLayout -eq "Management") { "Management" } else { "Deployment" }
+
+if ($config.GitTransport -notin @("https", "ssh")) {
+    throw [System.ArgumentException]::new("GitTransport must be 'https' or 'ssh', not '$($config.GitTransport)'.")
+}
+if ($config.GitTransport -eq "ssh" -and -not [string]::IsNullOrWhiteSpace($config.SshKeyPath) -and -not (Test-Path -Path $config.SshKeyPath -PathType Leaf)) {
+    throw [System.IO.FileNotFoundException]::new("SSH key not found at '$($config.SshKeyPath)'.")
+}
+# Applied to the Git processes this tool starts only; the caller's environment is untouched.
+if ($config.GitTransport -eq "ssh") {
+    Set-GitSshCommand -KeyPath $config.SshKeyPath
+}
+else {
+    Set-GitSshCommand -Clear
+}
 
 $isDryRun = $DryRun.IsPresent -or $WhatIfPreference
 $stagingRoot = $config.StagingDirectory
@@ -204,15 +285,16 @@ if ($config.IncludeModuleCI -and -not (Test-Path -Path $moduleScaffoldDir)) {
     throw [System.IO.DirectoryNotFoundException]::new("Module CI scaffold not found at '$moduleScaffoldDir'. Restore it, or pass -SkipModuleCI.")
 }
 
-# The deployment repository and the module repositories need different agent guidance,
+# The orchestration repository and the module repositories need different agent guidance,
 # so each component type has its own template set.
 $agentTemplatesRoot = Join-Path -Path $PSScriptRoot -ChildPath "templates\agents"
 $agentTemplateDirs = @{
+    Management = Join-Path -Path $agentTemplatesRoot -ChildPath "management"
     Deployment = Join-Path -Path $agentTemplatesRoot -ChildPath "deployment"
     Module     = Join-Path -Path $agentTemplatesRoot -ChildPath "module"
 }
 if ($config.IncludeAgentFiles) {
-    foreach ($dir in $agentTemplateDirs.Values) {
+    foreach ($dir in @($agentTemplateDirs[$orchestrationType], $agentTemplateDirs["Module"])) {
         if (-not (Test-Path -Path $dir)) {
             throw [System.IO.DirectoryNotFoundException]::new("Agent file templates not found at '$dir'. Restore them, or pass -SkipAgentFiles.")
         }
@@ -284,6 +366,10 @@ if (-not $discovery.HasDeployment -and -not $OnlyModules) {
     Write-ReleaseWarning "Deployment folder was not detected at '$($config.SourceRoot)\deployment'."
 }
 
+if ($orchestrationType -eq "Management" -and $discovery.HasDeployment -and -not $discovery.HasPipelines -and -not $OnlyModules) {
+    Write-ReleaseWarning "No '.github\workflows' under '$($config.SourceRoot)'. The management repository will be published without plan / apply pipelines."
+}
+
 Write-ReleaseSuccess "Discovered $(@($discovery.Modules).Count) modules and deployment framework."
 
 # Prompt interactively for missing core fields if Interactive switch is active
@@ -291,11 +377,19 @@ if ($Interactive.IsPresent) {
     Write-SectionHeader -Title "Interactive Configuration Wizard"
     $config.TargetOwner = Request-UserText -Prompt "Target GitHub Owner (Organisation or Username)" -DefaultValue $config.TargetOwner
     $config.Prefix = Request-UserText -Prompt "Repository name prefix" -DefaultValue $config.Prefix
-    $config.DeploymentRepoName = Request-UserText -Prompt "Deployment repository name template (tokens: {prefix})" -DefaultValue $config.DeploymentRepoName
+    $config.DeploymentLayout = Request-UserChoice -Prompt "Orchestration repository layout (Management = root with pipelines; Flat = deployment/ only)" -Options @("Management", "Flat") -DefaultIndex $(if ($config.DeploymentLayout -eq "Flat") { 1 } else { 0 })
+    $orchestrationType = if ($config.DeploymentLayout -eq "Management") { "Management" } else { "Deployment" }
+    if ($orchestrationType -eq "Management") {
+        $config.ManagementRepoName = Request-UserText -Prompt "Management repository name template (tokens: {prefix})" -DefaultValue $config.ManagementRepoName
+    }
+    else {
+        $config.DeploymentRepoName = Request-UserText -Prompt "Deployment repository name template (tokens: {prefix})" -DefaultValue $config.DeploymentRepoName
+    }
     $config.ModuleRepoPattern = Request-UserText -Prompt "Module repository name template (tokens: {prefix}, {module})" -DefaultValue $config.ModuleRepoPattern
     $config.Visibility = Request-UserChoice -Prompt "Repository Visibility" -Options @("private", "public", "internal") -DefaultIndex 0
 
-    Write-ReleaseInfo "Deployment repository resolves to: $(Expand-RepoNameTemplate -Template $config.DeploymentRepoName -Prefix $config.Prefix)"
+    $orchestrationTemplate = if ($orchestrationType -eq "Management") { $config.ManagementRepoName } else { $config.DeploymentRepoName }
+    Write-ReleaseInfo "$orchestrationType repository resolves to: $(Expand-RepoNameTemplate -Template $orchestrationTemplate -Prefix $config.Prefix)"
     Write-ReleaseInfo "Module repositories resolve to, for example: $(Expand-RepoNameTemplate -Template $config.ModuleRepoPattern -Prefix $config.Prefix -ModuleName 'zone_base')"
 }
 
@@ -328,21 +422,9 @@ Write-SectionHeader -Title "Release Execution Plan"
 
 $releasePlan = @()
 
-# Add deployment repository if selected
-if (-not $OnlyModules.IsPresent -and $discovery.HasDeployment) {
-    $repoName = Expand-RepoNameTemplate -Template $config.DeploymentRepoName -Prefix $config.Prefix
-    $releasePlan += [PSCustomObject]@{
-        ComponentType = "Deployment"
-        ComponentName = "deployment"
-        SourcePath    = $discovery.DeploymentDirectory
-        RepoName      = $repoName
-        TargetOwner   = $config.TargetOwner
-        RemoteUrl     = "https://github.com/$($config.TargetOwner)/$repoName.git"
-        Visibility    = $config.Visibility
-    }
-}
-
-# Add module repositories if selected
+# Module repositories first. The orchestration repository pins each layer's module source
+# to the latest tag of that module's repository, so it is released last, once every module
+# repository in this run exists.
 if (-not $OnlyDeployment.IsPresent) {
     $selectedModules = @($discovery.Modules)
     if (@($config.IncludeModules).Count -gt 0 -and @($config.IncludeModules)[0] -ne "All") {
@@ -366,6 +448,22 @@ if (-not $OnlyDeployment.IsPresent) {
     }
 }
 
+# Add the orchestration repository if selected: the management repository (the source root
+# minus 'modules/') or, in the flat layout, the 'deployment/' directory on its own.
+if (-not $OnlyModules.IsPresent -and $discovery.HasDeployment) {
+    $orchestrationTemplate = if ($orchestrationType -eq "Management") { $config.ManagementRepoName } else { $config.DeploymentRepoName }
+    $repoName = Expand-RepoNameTemplate -Template $orchestrationTemplate -Prefix $config.Prefix
+    $releasePlan += [PSCustomObject]@{
+        ComponentType = $orchestrationType
+        ComponentName = $orchestrationType.ToLowerInvariant()
+        SourcePath    = if ($orchestrationType -eq "Management") { $discovery.SourceRoot } else { $discovery.DeploymentDirectory }
+        RepoName      = $repoName
+        TargetOwner   = $config.TargetOwner
+        RemoteUrl     = "https://github.com/$($config.TargetOwner)/$repoName.git"
+        Visibility    = $config.Visibility
+    }
+}
+
 # Display plan table
 Write-Host ("{0,-12} | {1,-26} | {2,-52} | {3,-10}" -f "Type", "Component", "Repository Name", "Visibility") -ForegroundColor Cyan
 Write-Host ("-" * 108) -ForegroundColor DarkGray
@@ -374,6 +472,10 @@ foreach ($item in $releasePlan) {
 }
 Write-Host ("-" * 108) -ForegroundColor DarkGray
 Write-ReleaseInfo "Source: $($config.SourceRoot)"
+Write-ReleaseInfo "Orchestration layout: $($config.DeploymentLayout)$(if ($orchestrationType -eq 'Management') { " (source root minus 'modules/', pipelines included)" } else { " ('deployment/' only, no pipelines)" })"
+$examplePin = Expand-RepoNameTemplate -Template $config.ModuleRepoPattern -Prefix $config.Prefix -ModuleName "zone_base"
+Write-ReleaseInfo "Layer module sources: $(if ($config.RewriteModuleSources) { "repointed to git::https://github.com/$($config.TargetOwner)/$examplePin.git?ref=<$($config.ModuleSourceRef)> (and so on per module)" } else { 'left as upstream wrote them' })"
+Write-ReleaseInfo "Git transport: $(if ($config.GitTransport -eq 'ssh') { "SSH$(if ($config.SshKeyPath) { " with key '$($config.SshKeyPath)'" })" } else { 'HTTPS with the token' })"
 Write-ReleaseInfo "Module CI scaffold: $(if ($config.IncludeModuleCI) { "included from '$moduleScaffoldDir'" } else { 'skipped' })"
 Write-ReleaseInfo "Agent files (AGENTS.md / CLAUDE.md): $(if ($config.IncludeAgentFiles) { "included from '$agentTemplatesRoot'" } else { 'skipped' })"
 Write-ReleaseInfo "Total repositories to release: $(@($releasePlan).Count)"
@@ -388,7 +490,7 @@ if ($isDryRun) {
     Write-SectionHeader -Title "Dry Run Complete"
     Write-ReleaseInfo "Dry-run / WhatIf requested. No remote repositories or commits were created."
     if (-not $OnlyModules.IsPresent -and $config.SeedDeploymentOnce -and -not $ForceDeploymentUpdate.IsPresent) {
-        Write-ReleaseInfo "Note: an already-seeded deployment repository is skipped at execution time. Use -ForceDeploymentUpdate to re-release it."
+        Write-ReleaseInfo "Note: an already-seeded $($orchestrationType.ToLowerInvariant()) repository is skipped at execution time. Use -ForceDeploymentUpdate to re-release it."
     }
     return $releasePlan
 }
@@ -421,6 +523,20 @@ if ($null -eq $ownerDetails -or -not $ownerDetails.Found) {
 }
 
 $ownerType = $ownerDetails.Type
+
+# Checked before anything is created: a key that does not authenticate would otherwise leave
+# every repository created and empty.
+if ($config.GitTransport -eq "ssh") {
+    $sshIdentity = Test-GitHubSshIdentity
+    if (-not $sshIdentity.Login) {
+        throw [System.InvalidOperationException]::new(
+            "The SSH key did not authenticate to GitHub, so nothing was created. ssh said: $($sshIdentity.Output)")
+    }
+    Write-ReleaseInfo "Git transport: SSH, authenticating as '$($sshIdentity.Login)'."
+    if ($null -ne $currentUser -and $sshIdentity.Login -ne $currentUser.Login) {
+        Write-ReleaseWarning "The SSH key authenticates as '$($sshIdentity.Login)' but the token as '$($currentUser.Login)'. Repositories are created by '$($currentUser.Login)' and pushed by '$($sshIdentity.Login)', which needs write access to each of them."
+    }
+}
 
 if ($config.Visibility -eq "internal" -and $ownerType -ne "Organization") {
     throw [System.InvalidOperationException]::new(
@@ -460,7 +576,7 @@ foreach ($planItem in $releasePlan) {
         # A. Verify / Create Remote GitHub Repository
         Write-ReleaseInfo "Checking remote repository '$($planItem.TargetOwner)/$($planItem.RepoName)' on GitHub..."
         $existingRepo = Get-GitHubRepoDetails -Token $token -Owner $planItem.TargetOwner -RepoName $planItem.RepoName
-        $authPushUrl = "https://x-access-token:$token@github.com/$($planItem.TargetOwner)/$($planItem.RepoName).git"
+        $authPushUrl = Get-GitRemoteUrl -Transport $config.GitTransport -Owner $planItem.TargetOwner -RepoName $planItem.RepoName -Token $token
 
         $remoteHasCommits = $false
         if ($existingRepo.Exists) {
@@ -502,13 +618,63 @@ foreach ($planItem in $releasePlan) {
             -AuthenticatedUrl $authPushUrl `
             -DefaultBranch $config.DefaultBranch
 
-        # C. Copy Source Data As-Is
+        # C. Copy Source Data As-Is. The management repository is the source root, so the
+        # modules - each published as its own repository - are left out of it.
         Write-ReleaseInfo "Copying source data from '$($planItem.SourcePath)'..."
         $copyResult = Copy-SourceDataAsIs `
             -SourceDirectory $planItem.SourcePath `
             -DestinationDirectory $itemStagingDir `
-            -ComponentType $planItem.ComponentType
+            -ComponentType $planItem.ComponentType `
+            -ExcludeTopLevel $(if ($planItem.ComponentType -eq "Management") { @("modules") } else { @() })
         $itemResult.FileCount = $copyResult.FileCount
+
+        # Repoint layer module sources at the published module repositories. Upstream they
+        # name '../../../modules/<module>' or a 'cloudflare-platform-modules' placeholder,
+        # and neither resolves once the orchestration repository stands on its own.
+        if ($planItem.ComponentType -ne "Module" -and $config.RewriteModuleSources) {
+            # Every discovered module, not only those selected for this run: a layer may source
+            # a module whose repository was published by an earlier release.
+            $moduleRepoNames = @{}
+            foreach ($mod in $discovery.Modules) {
+                $moduleRepoNames[$mod.ModuleName] = Expand-RepoNameTemplate -Template $config.ModuleRepoPattern -Prefix $config.Prefix -ModuleName $mod.ModuleName
+            }
+
+            $owner = $planItem.TargetOwner
+            $transport = $config.GitTransport
+            $resolveTag = {
+                param($moduleRepo)
+                Get-LatestSemVerTag -WorkingDirectory $stagingRoot -AuthenticatedUrl (Get-GitRemoteUrl -Transport $transport -Owner $owner -RepoName $moduleRepo -Token $token)
+            }.GetNewClosure()
+
+            $rewrite = Set-OrchestrationModuleSource `
+                -StagingDirectory $itemStagingDir `
+                -ComponentType $planItem.ComponentType `
+                -ModuleRepoNames $moduleRepoNames `
+                -Owner $owner `
+                -ModuleSourceRef $config.ModuleSourceRef `
+                -ResolveLatestTag $resolveTag
+
+            foreach ($unknown in $rewrite.UnknownModules) {
+                Write-ReleaseWarning "A layer sources upstream module '$unknown', which is not under 'modules/'. Its source was left unchanged and will not resolve."
+            }
+
+            Write-ReleaseInfo "Repointed $(@($rewrite.Rewrites).Count) module sources in $($rewrite.LayerCount) layers at $(@($rewrite.Pins).Count) module repositories:"
+            foreach ($pin in $rewrite.Pins) {
+                Write-ReleaseInfo ("  {0,-28} -> {1}?ref={2} ({3})" -f $pin.Module, $pin.Repo, $pin.Ref, $pin.State)
+            }
+            foreach ($missing in @($rewrite.Pins | Where-Object { $_.State -eq "repository not found" })) {
+                Write-ReleaseWarning "Module repository '$owner/$($missing.Repo)' does not exist. Publish it, or 'terraform init' fails for every layer that sources '$($missing.Module)'."
+            }
+
+            if ($null -ne $rewrite.ModulesAuth) {
+                if ($rewrite.ModulesAuth.Updated) {
+                    Write-ReleaseInfo "modules-auth now mints its token for those $(@($rewrite.Pins).Count) repositories. Install the modules-reader GitHub App on each of them."
+                }
+                else {
+                    Write-ReleaseWarning "modules-auth was not updated ($($rewrite.ModulesAuth.Reason)). Pass the module repositories to it as a comma-separated 'repository' at every call site."
+                }
+            }
+        }
 
         if ($planItem.ComponentType -eq "Module" -and $config.IncludeModuleCI) {
             $scaffoldResult = Copy-ComponentScaffold -ScaffoldDirectory $moduleScaffoldDir -DestinationDirectory $itemStagingDir
@@ -524,7 +690,14 @@ foreach ($planItem in $releasePlan) {
             $itemResult.FileCount += $agentResult.FileCount
             Write-ReleaseInfo "Added $($agentResult.FileCount) agent context files."
             foreach ($kept in $agentResult.KeptFromSource) {
-                Write-ReleaseWarning "$($planItem.ComponentType) ships its own '$kept'; the agent template was not applied."
+                # Upstream's root AGENTS.md / CLAUDE.md are written for the management repository,
+                # so keeping them is the expected outcome there rather than something to flag.
+                if ($planItem.ComponentType -eq "Management") {
+                    Write-ReleaseInfo "Kept the source's own '$kept'; the agent template was not applied."
+                }
+                else {
+                    Write-ReleaseWarning "$($planItem.ComponentType) ships its own '$kept'; the agent template was not applied."
+                }
             }
         }
 
@@ -575,6 +748,14 @@ if ($CleanStaging -and (Test-Path -Path $stagingRoot)) {
 }
 
 # 8. Final Summary
+if ($orchestrationType -eq "Management" -and @($results | Where-Object { $_.ComponentType -eq "Management" -and $_.Status -eq "Completed" }).Count -gt 0) {
+    Write-SectionHeader -Title "Management Repository: Next Steps"
+    Write-ReleaseInfo "1. Create the modules-reader GitHub App and install it on every module repository listed above."
+    Write-ReleaseInfo "2. Set MODULES_APP_ID, MODULES_APP_PRIVATE_KEY, TF_BACKEND_BUCKET, TF_BACKEND_ENDPOINT, R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY."
+    Write-ReleaseInfo "3. Run .github/scripts/bootstrap-account-tokens.sh and bootstrap-environments.sh, then complete AGENTS.md."
+    Write-ReleaseInfo "Until then the management repository's CI fails at 'modules-auth'. See .github/workflows/README.md and VARIABLES_AND_SECRETS.md there."
+}
+
 Write-SectionHeader -Title "Release Execution Summary"
 $successCount = @($results | Where-Object { $_.Status -in @("Completed", "Unchanged", "Skipped") }).Count
 $failedCount = @($results | Where-Object { $_.Status -eq "Failed" }).Count

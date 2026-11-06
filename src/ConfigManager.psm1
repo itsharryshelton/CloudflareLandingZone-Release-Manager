@@ -10,14 +10,11 @@ function Get-ReleaseDefaultConfig {
     [CmdletBinding()]
     param ()
 
+    # The upstream checkout is expected beside this repository:
+    #   <parent>\CloudflareLandingZone-Release-Manager  (this tool)
+    #   <parent>\CloudflareLandingZone                  (the source)
     $workspaceParent = Split-Path -Path $PSScriptRoot -Parent
-    $defaultSourceRoot = "D:\Git\CloudflareLandingZone\CloudflareLandingZone"
-    if (-not (Test-Path -Path $defaultSourceRoot)) {
-        $siblingPath = Join-Path -Path (Split-Path -Path $workspaceParent -Parent) -ChildPath "CloudflareLandingZone"
-        if (Test-Path -Path $siblingPath) {
-            $defaultSourceRoot = $siblingPath
-        }
-    }
+    $defaultSourceRoot = Join-Path -Path (Split-Path -Path $workspaceParent -Parent) -ChildPath "CloudflareLandingZone"
 
     $defaultStaging = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath "cflz-release-staging"
 
@@ -27,12 +24,18 @@ function Get-ReleaseDefaultConfig {
         UpstreamRepoUrl     = "https://github.com/itsharryshelton/CloudflareLandingZone.git"
         UpstreamRef         = "main"
         Prefix              = "cflz"
+        DeploymentLayout    = "Management"
+        ManagementRepoName  = "{prefix}-management"
         DeploymentRepoName  = "{prefix}-deployment"
         ModuleRepoPattern   = "terraform-cloudflare-lz-{module}"
+        RewriteModuleSources = $true
+        ModuleSourceRef     = "latest"
         SeedDeploymentOnce  = $true
         IncludeModuleCI     = $true
         IncludeAgentFiles   = $true
         Visibility          = "private"
+        GitTransport        = "https"
+        SshKeyPath          = ""
         DefaultBranch       = "main"
         TargetOwner         = ""
         OwnerType           = "Auto"
@@ -149,12 +152,19 @@ function Export-ReleaseConfigFile {
         UpstreamRepoUrl    = $Config.UpstreamRepoUrl
         UpstreamRef        = $Config.UpstreamRef
         Prefix             = $Config.Prefix
+        DeploymentLayout   = $Config.DeploymentLayout
+        ManagementRepoName = $Config.ManagementRepoName
         DeploymentRepoName = $Config.DeploymentRepoName
         ModuleRepoPattern  = $Config.ModuleRepoPattern
+        RewriteModuleSources = $Config.RewriteModuleSources
+        ModuleSourceRef    = $Config.ModuleSourceRef
         SeedDeploymentOnce = $Config.SeedDeploymentOnce
         IncludeModuleCI    = $Config.IncludeModuleCI
         IncludeAgentFiles  = $Config.IncludeAgentFiles
         Visibility         = $Config.Visibility
+        GitTransport       = $Config.GitTransport
+        # A key's path, not the key: safe to persist.
+        SshKeyPath         = $Config.SshKeyPath
         DefaultBranch      = $Config.DefaultBranch
         TargetOwner        = $Config.TargetOwner
         OwnerType          = $Config.OwnerType
@@ -246,10 +256,16 @@ function Get-SourceDiscovery {
         }
     }
 
+    # The management repository is the source root minus 'modules/'. Its pipelines live
+    # under '.github/' at the root and address 'deployment/layers/*' by that path, so a
+    # source without '.github/' publishes a management repository that cannot run.
+    $hasPipelines = Test-Path -Path (Join-Path -Path $SourceRoot -ChildPath ".github\workflows")
+
     return [PSCustomObject]@{
         SourceRoot          = $SourceRoot
         DeploymentDirectory = if ($hasDeployment) { $deploymentDir } else { $null }
         HasDeployment       = $hasDeployment
+        HasPipelines        = $hasPipelines
         ModulesDirectory    = if (Test-Path -Path $modulesDir) { $modulesDir } else { $null }
         Modules             = $moduleList
     }

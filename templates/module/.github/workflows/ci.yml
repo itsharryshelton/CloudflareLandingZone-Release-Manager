@@ -147,8 +147,9 @@ jobs:
 
             # Output is captured, not streamed: nobody reads it on a green run.
             # -refresh=false and -lock=false: there is no state and no backend.
+            # -no-color: colour codes would stop the summary grep below matching '^Plan:'.
             if terraform -chdir="$dir" plan -input=false -lock=false -refresh=false \
-                 -compact-warnings "${varfiles[@]}" >plan.log 2>&1; then
+                 -no-color -compact-warnings "${varfiles[@]}" >plan.log 2>&1; then
               printf 'ok   %-24s %s\n' "$dir" "$(grep -E '^Plan:|^No changes' plan.log | tail -n1)"
               planned=$((planned + 1))
             elif [[ "$dir" == "." ]] && grep -q 'No value for required variable' plan.log; then

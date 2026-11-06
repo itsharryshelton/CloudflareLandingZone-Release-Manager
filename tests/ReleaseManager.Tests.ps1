@@ -6,6 +6,15 @@
     repository naming, publishing behaviour, and dry-run execution plans.
 #>
 
+BeforeDiscovery {
+    # The real upstream checkout is optional: tests that read it are skipped when it is absent.
+    # Set CFLZ_SOURCE_ROOT to point at a checkout elsewhere; the default is the sibling directory.
+    $discoveryRoot = if ($env:CFLZ_SOURCE_ROOT) { $env:CFLZ_SOURCE_ROOT } else {
+        Join-Path -Path (Split-Path -Path (Split-Path -Path $PSScriptRoot -Parent) -Parent) -ChildPath "CloudflareLandingZone"
+    }
+    $script:NoSourceMonorepo = -not (Test-Path -Path (Join-Path -Path $discoveryRoot -ChildPath "modules"))
+}
+
 BeforeAll {
     $repoRoot = Split-Path -Path $PSScriptRoot -Parent
     $srcDir = Join-Path -Path $repoRoot -ChildPath "src"
@@ -14,13 +23,108 @@ BeforeAll {
     Import-Module (Join-Path -Path $srcDir -ChildPath "ConfigManager.psm1") -Force
     Import-Module (Join-Path -Path $srcDir -ChildPath "GitHubApi.psm1") -Force
     Import-Module (Join-Path -Path $srcDir -ChildPath "RepoPublisher.psm1") -Force
+    Import-Module (Join-Path -Path $srcDir -ChildPath "SourceRewriter.psm1") -Force
 
-    $script:SourceMonorepo = "D:\Git\CloudflareLandingZone\CloudflareLandingZone"
+    $script:SourceMonorepo = if ($env:CFLZ_SOURCE_ROOT) { $env:CFLZ_SOURCE_ROOT } else {
+        Join-Path -Path (Split-Path -Path $repoRoot -Parent) -ChildPath "CloudflareLandingZone"
+    }
+    $script:ScriptPath = Join-Path -Path $repoRoot -ChildPath "Invoke-CloudflareLandingZoneRelease.ps1"
 
     function New-TestWorkspace {
         $path = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath "cflz-test-$([System.Guid]::NewGuid())"
         New-Item -Path $path -ItemType Directory -Force | Out-Null
         return $path
+    }
+
+    function Set-TestFile {
+        param([string]$Root, [string]$RelativePath, [string]$Content)
+        $path = Join-Path -Path $Root -ChildPath $RelativePath
+        $parent = Split-Path -Path $path -Parent
+        if (-not (Test-Path -Path $parent)) { New-Item -Path $parent -ItemType Directory -Force | Out-Null }
+        # LF endings, as a Git checkout on Linux CI would have them.
+        [System.IO.File]::WriteAllText($path, ($Content -replace "`r`n", "`n"), [System.Text.UTF8Encoding]::new($false))
+    }
+
+    # A small monorepo with the upstream shape: root pipelines, deployment/ and modules/,
+    # and layers referencing modules in each of the upstream source styles.
+    function New-FixtureMonorepo {
+        $root = New-TestWorkspace
+
+        Set-TestFile $root ".gitignore" "*.tfvars`n!deployment/accounts/*/*.tfvars`n**/local.auto.tfvars`n"
+        Set-TestFile $root "AGENTS.md" "upstream agent guidance"
+        Set-TestFile $root "CLAUDE.md" "@AGENTS.md"
+        Set-TestFile $root "README.md" "upstream readme"
+        Set-TestFile $root ".github/workflows/ci.yml" "name: CI"
+        Set-TestFile $root ".github/actions/modules-auth/action.yml" @"
+inputs:
+  repository:
+    description: 'Modules repository name, without the owner.'
+    required: false
+    default: cloudflare-platform-modules
+"@
+        Set-TestFile $root "deployment/README.md" "deployment readme"
+        Set-TestFile $root "deployment/accounts/account_a/zones.tfvars" "zones = {}"
+        Set-TestFile $root "deployment/layers/zones/terraform.tf" @"
+terraform {
+  required_providers {
+    cloudflare = {
+      source  = "cloudflare/cloudflare"
+      version = "~> 5.7"
+    }
+  }
+}
+"@
+        Set-TestFile $root "deployment/layers/zones/zones.tf" @"
+module "zones" {
+  # Pin downstream:
+  #   source = "git::https://github.com/yourorg/CloudflareLandingZone//modules/zone_base?ref=v1.0.0"
+  source   = "../../../modules/zone_base"
+  for_each = var.zones
+}
+"@
+        Set-TestFile $root "deployment/layers/dns/dns.tf" @"
+module "dns" {
+  source = "git::https://github.com/Your-Org/cloudflare-platform-modules//dns_records"
+}
+"@
+        Set-TestFile $root "deployment/layers/rules/rules.tf" @"
+module "cache_rules" {
+  source = "git::https://github.com/Your-Org/cloudflare-platform-modules//cache_rules?ref=v1.0.0"
+}
+
+module "zone_rules" {
+  source = "../../../modules/zone_rules"
+}
+"@
+        Set-TestFile $root "deployment/layers/legacy/legacy.tf" @"
+module "legacy" {
+  source = "../../../modules/retired_module"
+}
+"@
+        foreach ($m in @("_TEMPLATE", "zone_base", "dns_records", "cache_rules", "zone_rules")) {
+            Set-TestFile $root "modules/$m/main.tf" "# $m"
+        }
+
+        return $root
+    }
+
+    function New-BareRemoteWithTags {
+        param([string]$Root, [string]$Name, [string[]]$Tags = @())
+        $remote = Join-Path -Path $Root -ChildPath "$Name.git"
+        $work = Join-Path -Path $Root -ChildPath "$Name-work"
+        Invoke-GitCommand -WorkingDirectory $Root -Arguments @("init", "--bare", "-b", "main", $remote) | Out-Null
+        if ($Tags.Count -gt 0) {
+            New-Item -Path $work -ItemType Directory -Force | Out-Null
+            Invoke-GitCommand -WorkingDirectory $work -Arguments @("init", "-b", "main") | Out-Null
+            Invoke-GitCommand -WorkingDirectory $work -Arguments @("config", "user.email", "test@localhost") | Out-Null
+            Invoke-GitCommand -WorkingDirectory $work -Arguments @("config", "user.name", "Test") | Out-Null
+            Set-Content -Path (Join-Path $work "main.tf") -Value "# $Name"
+            Invoke-GitCommand -WorkingDirectory $work -Arguments @("add", "-A") | Out-Null
+            Invoke-GitCommand -WorkingDirectory $work -Arguments @("commit", "-m", "init") | Out-Null
+            foreach ($t in $Tags) { Invoke-GitCommand -WorkingDirectory $work -Arguments @("tag", $t) | Out-Null }
+            Invoke-GitCommand -WorkingDirectory $work -Arguments @("push", $remote, "main", "--tags") | Out-Null
+        }
+        return $remote
     }
 }
 
@@ -29,8 +133,12 @@ Describe "Configuration Manager" {
         It "Should generate default configuration with expected values" {
             $config = Get-ReleaseDefaultConfig
             $config.Prefix | Should -Be "cflz"
+            $config.DeploymentLayout | Should -Be "Management"
+            $config.ManagementRepoName | Should -Be "{prefix}-management"
             $config.DeploymentRepoName | Should -Be "{prefix}-deployment"
             $config.ModuleRepoPattern | Should -Be "terraform-cloudflare-lz-{module}"
+            $config.RewriteModuleSources | Should -Be $true
+            $config.ModuleSourceRef | Should -Be "latest"
             $config.SeedDeploymentOnce | Should -Be $true
             $config.Visibility | Should -Be "private"
             $config.DefaultBranch | Should -Be "main"
@@ -54,6 +162,9 @@ Describe "Configuration Manager" {
                 $imported.TargetOwner | Should -Be "TestOrg"
                 $imported.Visibility | Should -Be "private"
                 $imported.UpstreamRepoUrl | Should -Be "https://github.com/itsharryshelton/CloudflareLandingZone.git"
+                $imported.DeploymentLayout | Should -Be "Management"
+                $imported.ManagementRepoName | Should -Be "{prefix}-management"
+                $imported.ModuleSourceRef | Should -Be "latest"
             }
             finally {
                 if (Test-Path -Path $tempConfigPath) {
@@ -78,6 +189,12 @@ Describe "Configuration Manager" {
             $result.Config.DefaultBranch | Should -Be "main"
             $result.UnknownKeys | Should -Contain "NotARealSetting"
         }
+
+        It "Should accept every key in the shipped example configuration" {
+            $example = Import-ReleaseConfigFile -Path (Join-Path -Path (Split-Path -Path $PSScriptRoot -Parent) -ChildPath "release-config.example.json")
+            $result = Merge-ReleaseConfig -BaseConfig (Get-ReleaseDefaultConfig) -Overrides $example -WarningAction SilentlyContinue
+            $result.UnknownKeys | Should -BeNullOrEmpty
+        }
     }
 }
 
@@ -93,7 +210,8 @@ Describe "Repository Naming" {
     }
 
     Context "Expand-RepoNameTemplate" {
-        It "Should resolve the default deployment and module templates" {
+        It "Should resolve the default management, deployment and module templates" {
+            Expand-RepoNameTemplate -Template "{prefix}-management" -Prefix "cflz" | Should -Be "cflz-management"
             Expand-RepoNameTemplate -Template "{prefix}-deployment" -Prefix "cflz" | Should -Be "cflz-deployment"
             Expand-RepoNameTemplate -Template "terraform-cloudflare-lz-{module}" -Prefix "cflz" -ModuleName "zone_base" |
             Should -Be "terraform-cloudflare-lz-zone-base"
@@ -134,20 +252,46 @@ Describe "GitHub API Error Handling" {
 }
 
 Describe "Source Repository Discovery" {
+    Context "Fixture Discovery" {
+        It "Should discover the deployment directory, the pipelines and every module directory" {
+            $fixture = New-FixtureMonorepo
+            try {
+                $discovery = Get-SourceDiscovery -SourceRoot $fixture
+                $discovery.HasDeployment | Should -Be $true
+                $discovery.HasPipelines | Should -Be $true
+                @($discovery.Modules).Count | Should -Be 5
+                ($discovery.Modules | ForEach-Object { $_.ModuleName }) | Should -Contain "_TEMPLATE"
+            }
+            finally {
+                Remove-Item -Path $fixture -Recurse -Force
+            }
+        }
+    }
+
     Context "Real Source Directory Discovery" {
-        It "Should discover deployment directory and all 14 modules" {
+        It "Should discover the deployment directory and one module per directory under modules/" -Skip:$script:NoSourceMonorepo {
             $discovery = Get-SourceDiscovery -SourceRoot $script:SourceMonorepo
             $discovery.HasDeployment | Should -Be $true
-            $discovery.Modules.Count | Should -Be 14
+            $discovery.HasPipelines | Should -Be $true
+
+            # Counted rather than hard-coded: upstream adds modules regularly.
+            $expected = @(Get-ChildItem -Path (Join-Path $script:SourceMonorepo "modules") -Directory | Where-Object { $_.Name -notlike ".*" }).Count
+            @($discovery.Modules).Count | Should -Be $expected
 
             $moduleNames = $discovery.Modules | ForEach-Object { $_.ModuleName }
-            $moduleNames | Should -Contain "waf"
-            $moduleNames | Should -Contain "gateway"
-            $moduleNames | Should -Contain "zerotrust"
-            $moduleNames | Should -Contain "r2_bucket"
-            $moduleNames | Should -Contain "zone_base"
-            $moduleNames | Should -Contain "zone_rules"
-            $moduleNames | Should -Contain "_TEMPLATE"
+            foreach ($name in @("waf", "gateway", "zerotrust", "r2_bucket", "zone_base", "zone_rules", "dns_records", "_TEMPLATE")) {
+                $moduleNames | Should -Contain $name
+            }
+        }
+
+        It "Should find every layer module source pointing upstream at a known module" -Skip:$script:NoSourceMonorepo {
+            $discovery = Get-SourceDiscovery -SourceRoot $script:SourceMonorepo
+            $known = @($discovery.Modules | ForEach-Object { $_.ModuleName })
+            $refs = @(Find-LayerModuleReference -LayersDirectory (Join-Path $script:SourceMonorepo "deployment\layers") -KnownModules $known)
+
+            $refs.Count | Should -BeGreaterThan 0
+            @($refs | Where-Object { -not $_.Known }) | Should -BeNullOrEmpty
+            ($refs | ForEach-Object { $_.ModuleName }) | Should -Contain "zone_base"
         }
     }
 }
@@ -172,7 +316,6 @@ Describe "Source Copy and Filter Logic" {
                 $result = Copy-SourceDataAsIs -SourceDirectory $tempSource -DestinationDirectory $tempDest -ComponentType "Module"
 
                 Test-Path -Path "$tempDest\main.tf" | Should -Be $true
-                Test-Path -Path "$tempDest\.terraform.lock.hcl" | Should -Be $true
                 Test-Path -Path "$tempDest\subdir\helper.tf" | Should -Be $true
                 Test-Path -Path "$tempDest\.gitignore" | Should -Be $true
 
@@ -181,7 +324,10 @@ Describe "Source Copy and Filter Logic" {
                 Test-Path -Path "$tempDest\.git" | Should -Be $false
                 Test-Path -Path "$tempDest\terraform.tfstate" | Should -Be $false
 
-                $result.FileCount | Should -Be 3
+                # A module's lock file is never read by its callers, and a stale one breaks the module CI.
+                Test-Path -Path "$tempDest\.terraform.lock.hcl" | Should -Be $false
+
+                $result.FileCount | Should -Be 2
                 $result.Files | Should -Contain "main.tf"
             }
             finally {
@@ -190,7 +336,21 @@ Describe "Source Copy and Filter Logic" {
             }
         }
 
-        It "Should copy the full deployment tree including account variable files" {
+        It "Should keep a root module's lock file in a deployment release" {
+            $tempSource = New-TestWorkspace
+            $tempDest = New-TestWorkspace
+            try {
+                Set-TestFile $tempSource "layers/zones/zones.tf" "# layer"
+                Set-TestFile $tempSource "layers/zones/.terraform.lock.hcl" "# lock"
+                Copy-SourceDataAsIs -SourceDirectory $tempSource -DestinationDirectory $tempDest -ComponentType "Deployment" | Out-Null
+                Test-Path -Path "$tempDest\layers\zones\.terraform.lock.hcl" | Should -Be $true
+            }
+            finally {
+                Remove-Item -Path $tempSource, $tempDest -Recurse -Force
+            }
+        }
+
+        It "Should copy the full deployment tree including account variable files" -Skip:$script:NoSourceMonorepo {
             $tempDest = New-TestWorkspace
             try {
                 $result = Copy-SourceDataAsIs `
@@ -208,7 +368,91 @@ Describe "Source Copy and Filter Logic" {
         }
     }
 
+    Context "Management repository copy" {
+        It "Should copy the source root minus modules/, keeping the pipelines and the deployment/ path" {
+            $fixture = New-FixtureMonorepo
+            $dest = New-TestWorkspace
+            try {
+                $result = Copy-SourceDataAsIs -SourceDirectory $fixture -DestinationDirectory $dest -ComponentType "Management" -ExcludeTopLevel @("modules")
+
+                Test-Path -Path (Join-Path $dest ".github\workflows\ci.yml") | Should -Be $true
+                Test-Path -Path (Join-Path $dest ".github\actions\modules-auth\action.yml") | Should -Be $true
+                Test-Path -Path (Join-Path $dest "deployment\layers\zones\zones.tf") | Should -Be $true
+                Test-Path -Path (Join-Path $dest "deployment\accounts\account_a\zones.tfvars") | Should -Be $true
+                Test-Path -Path (Join-Path $dest "AGENTS.md") | Should -Be $true
+                Test-Path -Path (Join-Path $dest "modules") | Should -Be $false
+                @($result.Files | Where-Object { $_ -like "modules*" }) | Should -BeNullOrEmpty
+
+                # The source root's own .gitignore already uses deployment/-relative paths.
+                (Get-Content -Path (Join-Path $dest ".gitignore") -Raw) | Should -Match "!deployment/accounts/\*/\*\.tfvars"
+            }
+            finally {
+                Remove-Item -Path $fixture, $dest -Recurse -Force
+            }
+        }
+
+        It "Should only exclude a top-level directory, not one of the same name further down" {
+            $fixture = New-FixtureMonorepo
+            $dest = New-TestWorkspace
+            try {
+                Set-TestFile $fixture "deployment/layers/zones/modules/keep.txt" "nested"
+                Copy-SourceDataAsIs -SourceDirectory $fixture -DestinationDirectory $dest -ComponentType "Management" -ExcludeTopLevel @("modules") | Out-Null
+                Test-Path -Path (Join-Path $dest "deployment\layers\zones\modules\keep.txt") | Should -Be $true
+            }
+            finally {
+                Remove-Item -Path $fixture, $dest -Recurse -Force
+            }
+        }
+
+        It "Should release only Git-tracked files when the source is a local work tree" {
+            $fixture = New-FixtureMonorepo
+            $dest = New-TestWorkspace
+            try {
+                Invoke-GitCommand -WorkingDirectory $fixture -Arguments @("init", "-b", "main") | Out-Null
+                Invoke-GitCommand -WorkingDirectory $fixture -Arguments @("config", "user.email", "test@localhost") | Out-Null
+                Invoke-GitCommand -WorkingDirectory $fixture -Arguments @("config", "user.name", "Test") | Out-Null
+                Invoke-GitCommand -WorkingDirectory $fixture -Arguments @("add", "-A") | Out-Null
+                Invoke-GitCommand -WorkingDirectory $fixture -Arguments @("commit", "-m", "fixture") | Out-Null
+
+                # Local, uncommitted state an operator's checkout typically carries.
+                Set-TestFile $fixture ".claude/settings.local.json" "{}"
+                Set-TestFile $fixture "deployment/layers/zones/local.auto.tfvars" "api_token = `"secret`""
+                Set-TestFile $fixture "scratch-notes.md" "notes"
+                # An uncommitted edit to a tracked file is still released.
+                Set-TestFile $fixture "README.md" "edited locally"
+
+                Copy-SourceDataAsIs -SourceDirectory $fixture -DestinationDirectory $dest -ComponentType "Management" -ExcludeTopLevel @("modules") | Out-Null
+
+                Test-Path -Path (Join-Path $dest ".claude") | Should -Be $false
+                Test-Path -Path (Join-Path $dest "deployment\layers\zones\local.auto.tfvars") | Should -Be $false
+                Test-Path -Path (Join-Path $dest "scratch-notes.md") | Should -Be $false
+                (Get-Content -Path (Join-Path $dest "README.md") -Raw).Trim() | Should -Be "edited locally"
+                Test-Path -Path (Join-Path $dest "deployment\accounts\account_a\zones.tfvars") | Should -Be $true -Because "account trees are negated in the source .gitignore, so they are tracked"
+            }
+            finally {
+                Remove-Item -Path $fixture, $dest -Recurse -Force
+            }
+        }
+    }
+
     Context "Published .gitignore path correctness" {
+        It "Should keep account variable files committable at their management repository path" {
+            $workspace = New-TestWorkspace
+            try {
+                Invoke-GitCommand -WorkingDirectory $workspace -Arguments @("init") | Out-Null
+                Set-Content -Path (Join-Path -Path $workspace -ChildPath ".gitignore") `
+                    -Value (Get-ComponentGitIgnoreContent -ComponentType "Management") -Encoding utf8
+
+                (Invoke-GitCommand -WorkingDirectory $workspace -Arguments @("check-ignore", "deployment/accounts/account_a/waf.tfvars")).ExitCode | Should -Be 1
+                (Invoke-GitCommand -WorkingDirectory $workspace -Arguments @("check-ignore", "deployment/layers/waf/defaults.auto.tfvars")).ExitCode | Should -Be 1
+                (Invoke-GitCommand -WorkingDirectory $workspace -Arguments @("check-ignore", "deployment/layers/waf/local.auto.tfvars")).ExitCode | Should -Be 0
+                (Invoke-GitCommand -WorkingDirectory $workspace -Arguments @("check-ignore", "deployment/layers/waf/terraform.tfstate")).ExitCode | Should -Be 0
+            }
+            finally {
+                Remove-Item -Path $workspace -Recurse -Force
+            }
+        }
+
         It "Should not withhold deployment account variable files from the release" {
             # The monorepo policy negates 'deployment/accounts/*/*.tfvars'. Once 'deployment'
             # becomes its own repository root, that negation no longer matches and the blanket
@@ -310,6 +554,7 @@ Describe "Agent Context Files" {
 
     Context "Shipped templates" {
         It "Should carry AGENTS.md and CLAUDE.md for the <Type> template" -ForEach @(
+            @{ Type = "management" }
             @{ Type = "deployment" }
             @{ Type = "module" }
         ) {
@@ -433,6 +678,46 @@ Describe "Publishing Mechanics" {
             $gitConfig | Should -Match "https://github.com/example/repo.git"
         }
 
+        It "Should build the Git remote URL for each transport" {
+            Get-GitRemoteUrl -Transport "https" -Owner "acme" -RepoName "r" -Token "tok" | Should -Be "https://x-access-token:tok@github.com/acme/r.git"
+            Get-GitRemoteUrl -Transport "https" -Owner "acme" -RepoName "r" -Token "" | Should -Be "https://github.com/acme/r.git"
+            Get-GitRemoteUrl -Transport "ssh" -Owner "acme" -RepoName "r" -Token "tok" | Should -Be "git@github.com:acme/r.git"
+        }
+
+        It "Should pass the SSH command to Git processes only while it is set" {
+            $keyDir = New-TestWorkspace
+            try {
+                $key = Join-Path $keyDir "id test"
+                Set-Content -Path $key -Value "not a real key"
+                $expectedPath = (Resolve-Path $key).ProviderPath -replace '\\', '/'
+
+                Get-GitSshCommand -KeyPath $key | Should -Be "ssh -o BatchMode=yes -o IdentitiesOnly=yes -i `"$expectedPath`""
+                Get-GitSshCommand | Should -Be "ssh -o BatchMode=yes"
+
+                # A shell alias echoes what Git sees in its environment.
+                $show = @("-c", 'alias.showssh=!echo "[$GIT_SSH_COMMAND]"', "showssh")
+                Set-GitSshCommand -KeyPath $key
+                (Invoke-GitCommand -WorkingDirectory $keyDir -Arguments $show).Output | Should -Be "[ssh -o BatchMode=yes -o IdentitiesOnly=yes -i `"$expectedPath`"]"
+
+                Set-GitSshCommand -Clear
+                (Invoke-GitCommand -WorkingDirectory $keyDir -Arguments $show).Output | Should -Be "[$env:GIT_SSH_COMMAND]"
+                $env:GIT_SSH_COMMAND | Should -BeNullOrEmpty -Because "the caller's environment is never modified"
+            }
+            finally {
+                Set-GitSshCommand -Clear
+                Remove-Item -Path $keyDir -Recurse -Force
+            }
+        }
+
+        It "Should read the login from GitHub's SSH greeting, and nothing from a failure" {
+            ConvertFrom-GitHubSshGreeting -Text "Hi HarrySheltonFocus! You've successfully authenticated, but GitHub does not provide shell access." |
+                Should -Be "HarrySheltonFocus"
+            ConvertFrom-GitHubSshGreeting -Text "Hi acme/deploy-repo! You've successfully authenticated, but GitHub does not provide shell access." |
+                Should -Be "acme"
+            ConvertFrom-GitHubSshGreeting -Text "git@github.com: Permission denied (publickey)." | Should -BeNullOrEmpty
+            ConvertFrom-GitHubSshGreeting -Text "" | Should -BeNullOrEmpty
+        }
+
         It "Should redact credentials embedded in Git output" {
             Protect-GitOutput -Text "remote: rejected https://x-access-token:ghp_secretvalue@github.com/o/r.git" |
             Should -Be "remote: rejected https://***@github.com/o/r.git"
@@ -498,6 +783,16 @@ Describe "Re-run Policy" {
             (Get-ComponentReleaseAction -ComponentType "Deployment" -RepoExists $true -RemoteHasCommits $true -SeedDeploymentOnce $false).Action |
                 Should -Be "Update"
         }
+
+        It "Should apply the seed-once policy to the management repository" {
+            $action = Get-ComponentReleaseAction -ComponentType "Management" -RepoExists $true -RemoteHasCommits $true
+            $action.Action | Should -Be "Skip"
+            $action.Reason | Should -Match "^Management repository"
+            (Get-ComponentReleaseAction -ComponentType "Management" -RepoExists $true -RemoteHasCommits $true -ForceDeploymentUpdate $true).Action |
+                Should -Be "Update"
+            (Get-ComponentReleaseAction -ComponentType "Management" -RepoExists $false -RemoteHasCommits $false).Action |
+                Should -Be "Create"
+        }
     }
 
     Context "Mirror semantics for module repositories" {
@@ -549,6 +844,197 @@ Describe "Re-run Policy" {
     }
 }
 
+Describe "Module Source Rewriting" {
+    Context "Get-UpstreamModuleName" {
+        It "Should recognise the upstream source form <Source>" -ForEach @(
+            @{ Source = "../../../modules/zone_base"; Expected = "zone_base" }
+            @{ Source = "../../modules/waf/"; Expected = "waf" }
+            @{ Source = "git::https://github.com/Your-Org/cloudflare-platform-modules//dns_records"; Expected = "dns_records" }
+            @{ Source = "git::https://github.com/Your-Org/cloudflare-platform-modules//cache_rules?ref=v1.0.0"; Expected = "cache_rules" }
+            @{ Source = "git::https://github.com/acme/cloudflare-platform-modules.git//gateway?ref=v2.1.0"; Expected = "gateway" }
+            @{ Source = "git::https://github.com/yourorg/CloudflareLandingZone//modules/zerotrust?ref=v1.0.0"; Expected = "zerotrust" }
+        ) {
+            Get-UpstreamModuleName -Source $Source | Should -Be $Expected
+        }
+
+        It "Should leave <Source> alone" -ForEach @(
+            @{ Source = "cloudflare/cloudflare" }
+            @{ Source = "terraform-aws-modules/vpc/aws" }
+            @{ Source = "git::https://github.com/acme/terraform-cloudflare-lz-zone-base.git?ref=v1.0.0" }
+            @{ Source = "git::https://github.com/third-party/some-modules//waf" }
+        ) {
+            Get-UpstreamModuleName -Source $Source | Should -BeNullOrEmpty
+        }
+    }
+
+    Context "Set-OrchestrationModuleSource on a management repository" {
+        BeforeEach {
+            $script:fixture = New-FixtureMonorepo
+            $script:staged = New-TestWorkspace
+            Copy-SourceDataAsIs -SourceDirectory $script:fixture -DestinationDirectory $script:staged -ComponentType "Management" -ExcludeTopLevel @("modules") | Out-Null
+            $script:repoNames = @{}
+            foreach ($m in @("_TEMPLATE", "zone_base", "dns_records", "cache_rules", "zone_rules")) {
+                $script:repoNames[$m] = Expand-RepoNameTemplate -Template "terraform-cloudflare-lz-{module}" -Prefix "cflz" -ModuleName $m
+            }
+        }
+
+        AfterEach {
+            Remove-Item -Path $script:fixture, $script:staged -Recurse -Force
+        }
+
+        It "Should repoint every upstream source at its module repository and pin the ref" {
+            $result = Set-OrchestrationModuleSource -StagingDirectory $script:staged -ComponentType "Management" `
+                -ModuleRepoNames $script:repoNames -Owner "acme" -ModuleSourceRef "v1.2.3"
+
+            @($result.Rewrites).Count | Should -Be 4
+            $result.LayerCount | Should -Be 3
+            $result.UnknownModules | Should -Be @("retired_module")
+
+            $zones = Get-Content -Path (Join-Path $script:staged "deployment\layers\zones\zones.tf") -Raw
+            $zones | Should -Match ([regex]::Escape('  source   = "git::https://github.com/acme/terraform-cloudflare-lz-zone-base.git?ref=v1.2.3"'))
+            # The commented example above the block is documentation and is left as written.
+            $zones | Should -Match ([regex]::Escape('#   source = "git::https://github.com/yourorg/CloudflareLandingZone//modules/zone_base?ref=v1.0.0"'))
+            $zones | Should -Not -Match "`r`n"
+
+            $rules = Get-Content -Path (Join-Path $script:staged "deployment\layers\rules\rules.tf") -Raw
+            $rules | Should -Match ([regex]::Escape('"git::https://github.com/acme/terraform-cloudflare-lz-cache-rules.git?ref=v1.2.3"'))
+            $rules | Should -Match ([regex]::Escape('"git::https://github.com/acme/terraform-cloudflare-lz-zone-rules.git?ref=v1.2.3"'))
+
+            (Get-Content -Path (Join-Path $script:staged "deployment\layers\dns\dns.tf") -Raw) |
+                Should -Match ([regex]::Escape('"git::https://github.com/acme/terraform-cloudflare-lz-dns-records.git?ref=v1.2.3"'))
+
+            # Provider sources and unknown modules are untouched.
+            (Get-Content -Path (Join-Path $script:staged "deployment\layers\zones\terraform.tf") -Raw) | Should -Match ([regex]::Escape('source  = "cloudflare/cloudflare"'))
+            (Get-Content -Path (Join-Path $script:staged "deployment\layers\legacy\legacy.tf") -Raw) | Should -Match ([regex]::Escape('"../../../modules/retired_module"'))
+        }
+
+        It "Should grant modules-auth exactly the module repositories the layers source" {
+            $result = Set-OrchestrationModuleSource -StagingDirectory $script:staged -ComponentType "Management" `
+                -ModuleRepoNames $script:repoNames -Owner "acme" -ModuleSourceRef "v1.0.0"
+
+            $result.ModulesAuth.Updated | Should -Be $true
+            $action = Get-Content -Path (Join-Path $script:staged ".github\actions\modules-auth\action.yml") -Raw
+            $action | Should -Match "(?m)^    default: terraform-cloudflare-lz-cache-rules,terraform-cloudflare-lz-dns-records,terraform-cloudflare-lz-zone-base,terraform-cloudflare-lz-zone-rules$"
+            $action | Should -Not -Match "cloudflare-platform-modules"
+            $action | Should -Not -Match "terraform-cloudflare-lz-template"
+        }
+
+        It "Should be idempotent over an already-rewritten tree" {
+            Set-OrchestrationModuleSource -StagingDirectory $script:staged -ComponentType "Management" `
+                -ModuleRepoNames $script:repoNames -Owner "acme" -ModuleSourceRef "v1.0.0" | Out-Null
+            $second = Set-OrchestrationModuleSource -StagingDirectory $script:staged -ComponentType "Management" `
+                -ModuleRepoNames $script:repoNames -Owner "acme" -ModuleSourceRef "v9.9.9"
+
+            @($second.Rewrites).Count | Should -Be 0
+            (Get-Content -Path (Join-Path $script:staged "deployment\layers\dns\dns.tf") -Raw) | Should -Match "\?ref=v1\.0\.0"
+        }
+
+        It "Should pin to each repository's latest tag, or v1.0.0 where there is none yet" {
+            $resolver = {
+                param($repo)
+                switch ($repo) {
+                    "terraform-cloudflare-lz-zone-base" { [PSCustomObject]@{ Reachable = $true; Tag = "v1.4.2" } }
+                    "terraform-cloudflare-lz-dns-records" { [PSCustomObject]@{ Reachable = $true; Tag = $null } }
+                    default { [PSCustomObject]@{ Reachable = $false; Tag = $null } }
+                }
+            }
+
+            $result = Set-OrchestrationModuleSource -StagingDirectory $script:staged -ComponentType "Management" `
+                -ModuleRepoNames $script:repoNames -Owner "acme" -ModuleSourceRef "latest" -ResolveLatestTag $resolver
+
+            $pins = @{}
+            foreach ($p in $result.Pins) { $pins[$p.Module] = $p }
+            $pins["zone_base"].Ref | Should -Be "v1.4.2"
+            $pins["zone_base"].State | Should -Be "latest tag"
+            $pins["dns_records"].Ref | Should -Be "v1.0.0"
+            $pins["dns_records"].State | Should -Be "awaiting first CI tag"
+            $pins["cache_rules"].State | Should -Be "repository not found"
+        }
+
+        It "Should repoint a flat deployment repository's layers without touching modules-auth" {
+            $flat = New-TestWorkspace
+            try {
+                Copy-SourceDataAsIs -SourceDirectory (Join-Path $script:fixture "deployment") -DestinationDirectory $flat -ComponentType "Deployment" | Out-Null
+                $result = Set-OrchestrationModuleSource -StagingDirectory $flat -ComponentType "Deployment" `
+                    -ModuleRepoNames $script:repoNames -Owner "acme" -ModuleSourceRef "v1.0.0"
+
+                @($result.Rewrites).Count | Should -Be 4
+                $result.ModulesAuth | Should -BeNullOrEmpty
+                (Get-Content -Path (Join-Path $flat "layers\zones\zones.tf") -Raw) | Should -Match "terraform-cloudflare-lz-zone-base\.git\?ref=v1\.0\.0"
+            }
+            finally {
+                Remove-Item -Path $flat -Recurse -Force
+            }
+        }
+    }
+
+    Context "Get-LatestSemVerTag" {
+        It "Should return the highest strict vX.Y.Z tag, ignoring anything else" {
+            $root = New-TestWorkspace
+            try {
+                $remote = New-BareRemoteWithTags -Root $root -Name "mod" -Tags @("v1.2.0", "v1.10.0", "v1.9.3", "v2-rc", "release-3", "v0.9.0")
+                $info = Get-LatestSemVerTag -WorkingDirectory $root -AuthenticatedUrl $remote
+                $info.Reachable | Should -Be $true
+                $info.Tag | Should -Be "v1.10.0"
+            }
+            finally {
+                Remove-Item -Path $root -Recurse -Force
+            }
+        }
+
+        It "Should report a reachable repository with no tags, and an unreachable one" {
+            $root = New-TestWorkspace
+            try {
+                $empty = New-BareRemoteWithTags -Root $root -Name "empty"
+                $none = Get-LatestSemVerTag -WorkingDirectory $root -AuthenticatedUrl $empty
+                $none.Reachable | Should -Be $true
+                $none.Tag | Should -BeNullOrEmpty
+
+                $missing = Get-LatestSemVerTag -WorkingDirectory $root -AuthenticatedUrl (Join-Path $root "does-not-exist.git")
+                $missing.Reachable | Should -Be $false
+            }
+            finally {
+                Remove-Item -Path $root -Recurse -Force
+            }
+        }
+    }
+
+    Context "Management repository published to a local bare remote" {
+        It "Should publish pipelines, deployment/ and repointed sources, and no modules/" {
+            $fixture = New-FixtureMonorepo
+            $root = New-TestWorkspace
+            try {
+                $remote = Join-Path $root "cflz-management.git"
+                $staging = Join-Path $root "staging"
+                Invoke-GitCommand -WorkingDirectory $root -Arguments @("init", "--bare", "-b", "main", $remote) | Out-Null
+
+                Initialize-StagingRepository -StagingPath $staging -RemoteUrl $remote -AuthenticatedUrl $remote -DefaultBranch "main" | Out-Null
+                Copy-SourceDataAsIs -SourceDirectory $fixture -DestinationDirectory $staging -ComponentType "Management" -ExcludeTopLevel @("modules") | Out-Null
+                $names = @{ zone_base = "terraform-cloudflare-lz-zone-base"; dns_records = "terraform-cloudflare-lz-dns-records"; cache_rules = "terraform-cloudflare-lz-cache-rules"; zone_rules = "terraform-cloudflare-lz-zone-rules" }
+                Set-OrchestrationModuleSource -StagingDirectory $staging -ComponentType "Management" -ModuleRepoNames $names -Owner "acme" -ModuleSourceRef "v1.0.0" | Out-Null
+                $agents = Copy-ComponentScaffold -ScaffoldDirectory (Join-Path (Split-Path $PSScriptRoot -Parent) "templates\agents\management") -DestinationDirectory $staging
+                Publish-LocalRepository -StagingPath $staging -RemoteUrl $remote -AuthenticatedPushUrl $remote -DefaultBranch "main" -CommitMessage "Initial release" | Out-Null
+
+                # Upstream ships its own AGENTS.md / CLAUDE.md at the root; those win.
+                $agents.KeptFromSource | Should -Contain "AGENTS.md"
+                (Invoke-GitCommand -WorkingDirectory $remote -Arguments @("show", "main:AGENTS.md")).Output | Should -Be "upstream agent guidance"
+
+                $tree = (Invoke-GitCommand -WorkingDirectory $remote -Arguments @("ls-tree", "-r", "--name-only", "main")).Output -split "`r?`n"
+                $tree | Should -Contain ".github/workflows/ci.yml"
+                $tree | Should -Contain "deployment/layers/zones/zones.tf"
+                $tree | Should -Contain "deployment/accounts/account_a/zones.tfvars"
+                @($tree | Where-Object { $_ -like "modules/*" }) | Should -BeNullOrEmpty
+
+                (Invoke-GitCommand -WorkingDirectory $remote -Arguments @("show", "main:deployment/layers/dns/dns.tf")).Output |
+                    Should -Match "terraform-cloudflare-lz-dns-records\.git\?ref=v1\.0\.0"
+            }
+            finally {
+                Remove-Item -Path $fixture, $root -Recurse -Force
+            }
+        }
+    }
+}
+
 Describe "Organisation Targeting" {
     Context "Get-NewRepositoryPayload" {
         It "Should send the explicit visibility field for organisation repositories" {
@@ -581,59 +1067,108 @@ Describe "Organisation Targeting" {
 }
 
 Describe "Release Plan Generation (Dry Run)" {
+    BeforeAll {
+        $script:planFixture = New-FixtureMonorepo
+        # Keep dry runs offline: with no token there is no GitHub API call to resolve the owner.
+        # The script re-imports its modules, so a Pester mock would not survive; hiding the gh
+        # CLI from PATH does.
+        $script:savedEnv = @{ GITHUB_TOKEN = $env:GITHUB_TOKEN; GH_TOKEN = $env:GH_TOKEN; PATH = $env:PATH }
+        $env:GITHUB_TOKEN = $null
+        $env:GH_TOKEN = $null
+        $sep = [System.IO.Path]::PathSeparator
+        $env:PATH = (@($env:PATH -split $sep | Where-Object {
+                    $_ -and -not (Test-Path -Path (Join-Path $_ "gh.exe")) -and -not (Test-Path -Path (Join-Path $_ "gh"))
+                }) -join $sep)
+
+        function Invoke-DryRun {
+            param([hashtable]$Arguments = @{})
+            & $script:ScriptPath -TargetOwner "test-org" -WhatIf -SourceRoot $script:planFixture @Arguments 6>$null
+        }
+    }
+
+    AfterAll {
+        $env:GITHUB_TOKEN = $script:savedEnv.GITHUB_TOKEN
+        $env:GH_TOKEN = $script:savedEnv.GH_TOKEN
+        $env:PATH = $script:savedEnv.PATH
+        Remove-Item -Path $script:planFixture -Recurse -Force
+    }
+
     Context "Invoke-CloudflareLandingZoneRelease -WhatIf" {
-        It "Should generate execution plan with 15 total repositories (1 deployment + 14 modules)" {
-            $scriptPath = Join-Path -Path (Split-Path -Path $PSScriptRoot -Parent) -ChildPath "Invoke-CloudflareLandingZoneRelease.ps1"
-            $plan = & $scriptPath -TargetOwner "test-org" -WhatIf -SourceRoot $script:SourceMonorepo
+        It "Should plan every module, then the management repository last" {
+            $plan = @(Invoke-DryRun)
 
-            $plan | Should -Not -BeNullOrEmpty
-            $plan.Count | Should -Be 15
+            $plan.Count | Should -Be 6
+            $plan[-1].ComponentType | Should -Be "Management"
+            $plan[-1].ComponentName | Should -Be "management"
+            $plan[-1].RepoName | Should -Be "cflz-management"
+            $plan[-1].RemoteUrl | Should -Be "https://github.com/test-org/cflz-management.git"
+            $plan[-1].SourcePath | Should -Be $script:planFixture
+            @($plan | Where-Object { $_.ComponentType -eq "Deployment" }) | Should -BeNullOrEmpty
 
-            $deploymentItem = $plan | Where-Object { $_.ComponentType -eq "Deployment" }
-            $deploymentItem | Should -Not -BeNullOrEmpty
-            $deploymentItem.RepoName | Should -Be "cflz-deployment"
-            $deploymentItem.RemoteUrl | Should -Be "https://github.com/test-org/cflz-deployment.git"
+            ($plan | Where-Object { $_.ComponentName -eq "zone_base" }).RepoName | Should -Be "terraform-cloudflare-lz-zone-base"
+            ($plan | Where-Object { $_.ComponentName -eq "_TEMPLATE" }).RepoName | Should -Be "terraform-cloudflare-lz-template"
+        }
 
-            $wafModuleItem = $plan | Where-Object { $_.ComponentName -eq "waf" }
-            $wafModuleItem | Should -Not -BeNullOrEmpty
-            $wafModuleItem.RepoName | Should -Be "terraform-cloudflare-lz-waf"
-            $wafModuleItem.RemoteUrl | Should -Be "https://github.com/test-org/terraform-cloudflare-lz-waf.git"
+        It "Should plan a flat deployment repository when the layout is Flat" {
+            $plan = @(Invoke-DryRun @{ DeploymentLayout = "Flat" })
 
-            $governanceItem = $plan | Where-Object { $_.ComponentName -eq "account_governance" }
-            $governanceItem.RepoName | Should -Be "terraform-cloudflare-lz-account-governance"
-
-            $templateItem = $plan | Where-Object { $_.ComponentName -eq "_TEMPLATE" }
-            $templateItem.RepoName | Should -Be "terraform-cloudflare-lz-template"
+            $plan.Count | Should -Be 6
+            $plan[-1].ComponentType | Should -Be "Deployment"
+            $plan[-1].RepoName | Should -Be "cflz-deployment"
+            $plan[-1].SourcePath | Should -Be (Join-Path $script:planFixture "deployment")
         }
 
         It "Should honour module selection and exclusion switches" {
-            $scriptPath = Join-Path -Path (Split-Path -Path $PSScriptRoot -Parent) -ChildPath "Invoke-CloudflareLandingZoneRelease.ps1"
+            $modulesOnly = @(Invoke-DryRun @{ OnlyModules = $true; ExcludeModules = "_TEMPLATE" })
+            $modulesOnly.Count | Should -Be 4
+            @($modulesOnly | Where-Object { $_.ComponentType -ne "Module" }) | Should -BeNullOrEmpty
+            @($modulesOnly | Where-Object { $_.ComponentName -eq "_TEMPLATE" }) | Should -BeNullOrEmpty
 
-            $modulesOnly = & $scriptPath -TargetOwner "test-org" -WhatIf -SourceRoot $script:SourceMonorepo -OnlyModules -ExcludeModules "_TEMPLATE"
-            $modulesOnly.Count | Should -Be 13
-            ($modulesOnly | Where-Object { $_.ComponentType -eq "Deployment" }) | Should -BeNullOrEmpty
-            ($modulesOnly | Where-Object { $_.ComponentName -eq "_TEMPLATE" }) | Should -BeNullOrEmpty
+            $managementOnly = @(Invoke-DryRun @{ OnlyDeployment = $true })
+            $managementOnly.Count | Should -Be 1
+            $managementOnly[0].ComponentType | Should -Be "Management"
 
-            $deploymentOnly = & $scriptPath -TargetOwner "test-org" -WhatIf -SourceRoot $script:SourceMonorepo -OnlyDeployment
-            $deploymentOnly.Count | Should -Be 1
-            $deploymentOnly.ComponentType | Should -Be "Deployment"
-
-            $singleModule = & $scriptPath -TargetOwner "test-org" -WhatIf -SourceRoot $script:SourceMonorepo -OnlyModules -Modules "waf", "gateway"
-            $singleModule.Count | Should -Be 2
+            $selected = @(Invoke-DryRun @{ OnlyModules = $true; Modules = @("zone_base", "dns_records") })
+            $selected.Count | Should -Be 2
         }
 
-        It "Should apply a custom prefix and module pattern to the plan" {
-            $scriptPath = Join-Path -Path (Split-Path -Path $PSScriptRoot -Parent) -ChildPath "Invoke-CloudflareLandingZoneRelease.ps1"
+        It "Should accept -OnlyManagement and -ForceManagementUpdate as aliases" {
+            $plan = @(& $script:ScriptPath -TargetOwner "test-org" -WhatIf -SourceRoot $script:planFixture -OnlyManagement -ForceManagementUpdate 6>$null)
+            $plan.Count | Should -Be 1
+            $plan[0].ComponentType | Should -Be "Management"
+        }
 
-            $plan = & $scriptPath -TargetOwner "test-org" -WhatIf -SourceRoot $script:SourceMonorepo `
-                -Prefix "cflz" -Modules "waf" -OnlyModules
+        It "Should apply a custom prefix and name templates to the plan" {
+            (Invoke-DryRun @{ Prefix = "acme"; Modules = "zone_base"; OnlyModules = $true }).RepoName | Should -Be "terraform-cloudflare-lz-zone-base"
+            (Invoke-DryRun @{ Prefix = "acme"; ModuleRepoPattern = "{prefix}-tf-{module}"; Modules = "zone_base"; OnlyModules = $true }).RepoName | Should -Be "acme-tf-zone-base"
+            (Invoke-DryRun @{ Prefix = "acme"; ManagementRepoName = "{prefix}-landing-zone"; OnlyDeployment = $true }).RepoName | Should -Be "acme-landing-zone"
+            (Invoke-DryRun @{ Prefix = "acme"; DeploymentLayout = "Flat"; DeploymentRepoName = "{prefix}-lz-deploy"; OnlyDeployment = $true }).RepoName | Should -Be "acme-lz-deploy"
+        }
 
-            $plan.RepoName | Should -Be "terraform-cloudflare-lz-waf"
+        It "Should reject an SSH key path that does not exist" {
+            { & $script:ScriptPath -TargetOwner "test-org" -WhatIf -SourceRoot $script:planFixture -GitTransport ssh -SshKeyPath "Z:\no\such\key" 6>$null } |
+                Should -Throw -ExpectedMessage "*SSH key not found*"
+        }
 
-            $custom = & $scriptPath -TargetOwner "test-org" -WhatIf -SourceRoot $script:SourceMonorepo `
-                -Prefix "cflz" -DeploymentRepoName "{prefix}-landing-zone" -ModuleRepoPattern "{prefix}-tf-{module}" -OnlyDeployment
+        It "Should reject an unknown layout from a configuration file" {
+            $cfg = Join-Path ([System.IO.Path]::GetTempPath()) "cflz-test-layout-$([guid]::NewGuid()).json"
+            try {
+                Set-Content -Path $cfg -Value '{ "DeploymentLayout": "Sideways" }'
+                { & $script:ScriptPath -TargetOwner "test-org" -WhatIf -SourceRoot $script:planFixture -ConfigFile $cfg 6>$null } |
+                    Should -Throw -ExpectedMessage "*DeploymentLayout must be*"
+            }
+            finally {
+                Remove-Item -Path $cfg -Force -ErrorAction SilentlyContinue
+            }
+        }
 
-            $custom.RepoName | Should -Be "cflz-landing-zone"
+        It "Should plan the real upstream checkout with one repository per module plus management" -Skip:$script:NoSourceMonorepo {
+            $plan = @(& $script:ScriptPath -TargetOwner "test-org" -WhatIf -SourceRoot $script:SourceMonorepo 6>$null)
+            $moduleCount = @(Get-ChildItem -Path (Join-Path $script:SourceMonorepo "modules") -Directory | Where-Object { $_.Name -notlike ".*" }).Count
+
+            $plan.Count | Should -Be ($moduleCount + 1)
+            @($plan | Where-Object { $_.ComponentType -eq "Module" }).Count | Should -Be $moduleCount
+            $plan[-1].RepoName | Should -Be "cflz-management"
         }
     }
 }

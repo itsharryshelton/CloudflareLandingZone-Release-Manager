@@ -19,7 +19,7 @@ function Get-ComponentGitIgnoreContent {
     [CmdletBinding()]
     param (
         [Parameter(Mandatory = $false)]
-        [ValidateSet("Deployment", "Module")]
+        [ValidateSet("Management", "Deployment", "Module")]
         [string]$ComponentType = "Deployment"
     )
 
@@ -53,7 +53,20 @@ tfplan.json
 !*.tfvars.example
 "@
 
-    $componentSpecific = if ($ComponentType -eq "Deployment") {
+    $componentSpecific = if ($ComponentType -eq "Management") {
+        @"
+
+# Exceptions. The management repository keeps the upstream layout, so 'deployment/'
+# is still a directory under the repository root and the upstream paths apply as-is.
+# Layer defaults are customer-agnostic. Account trees carry account identifiers and
+# domains, which are configuration rather than secrets, and this repository is private
+# with RBAC. API tokens and R2 keys are never present: they arrive at runtime as
+# CLOUDFLARE_API_TOKEN / AWS_* environment variables.
+!deployment/layers/*/defaults.auto.tfvars
+!deployment/accounts/*/*.tfvars
+"@
+    }
+    elseif ($ComponentType -eq "Deployment") {
         @"
 
 # Exceptions, expressed relative to the root of THIS repository (the deployment tree).
@@ -104,7 +117,55 @@ function Get-StandardGitIgnoreContent {
     return (Get-ComponentGitIgnoreContent -ComponentType "Deployment")
 }
 
+function Get-GitTrackedFileSet {
+    <#
+    .SYNOPSIS
+        Returns the files Git tracks under a directory, or $null when it is not in a work tree.
+    .DESCRIPTION
+        Paths are relative to -Directory and use forward slashes. A release cut from a local
+        working tree is restricted to this set, so that untracked local files (agent settings,
+        scratch notes, an operator's local.auto.tfvars) never reach a published repository.
+        The publish step stages with 'git add --force', so the source's .gitignore cannot be
+        relied on to keep them out.
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$Directory
+    )
+
+    $inside = Invoke-GitCommand -WorkingDirectory $Directory -Arguments @("rev-parse", "--is-inside-work-tree")
+    if ($inside.ExitCode -ne 0 -or $inside.Output -ne "true") {
+        return $null
+    }
+
+    $listed = Invoke-GitCommand -WorkingDirectory $Directory -Arguments @("ls-files", "-z")
+    if ($listed.ExitCode -ne 0) {
+        throw [System.InvalidOperationException]::new("Unable to list tracked files under '$Directory': $($listed.Error)")
+    }
+
+    $set = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($path in ($listed.Output -split "`0")) {
+        if (-not [string]::IsNullOrWhiteSpace($path)) {
+            $set.Add($path.Trim()) | Out-Null
+        }
+    }
+
+    return , $set
+}
+
 function Copy-SourceDataAsIs {
+    <#
+    .SYNOPSIS
+        Copies a component's source tree into a staging directory, minus ephemeral artefacts.
+    .DESCRIPTION
+        When the source sits in a Git work tree, only tracked files are copied (with their
+        working-tree content). A fresh upstream clone tracks everything it holds, so this only
+        narrows a release cut from a local checkout.
+
+        -ExcludeTopLevel drops whole top-level directories, matched on the first path segment
+        only. The management repository uses it to leave 'modules/' out of the source root.
+    #>
     [CmdletBinding()]
     param (
         [Parameter(Mandatory = $true)]
@@ -114,8 +175,11 @@ function Copy-SourceDataAsIs {
         [string]$DestinationDirectory,
 
         [Parameter(Mandatory = $false)]
-        [ValidateSet("Deployment", "Module")]
-        [string]$ComponentType = "Deployment"
+        [ValidateSet("Management", "Deployment", "Module")]
+        [string]$ComponentType = "Deployment",
+
+        [Parameter(Mandatory = $false)]
+        [string[]]$ExcludeTopLevel = @()
     )
 
     if (-not (Test-Path -Path $SourceDirectory)) {
@@ -133,11 +197,31 @@ function Copy-SourceDataAsIs {
     $excludeDirs = @(".git", ".terraform", "bin", "obj", ".idea", ".vscode")
     $excludeFiles = @("*.tfstate", "*.tfstate.*", "*.tfplan", "crash.log", "crash.*.log")
 
+    # Terraform reads the lock file of the root module only, so a module's own lock file is
+    # never consulted by a layer that calls it. All it does in a module repository is pin the
+    # module CI to whichever provider build, and whichever platform's hashes, the committer's
+    # last local 'terraform init' produced - a Windows-only hash fails init on a Linux runner.
+    # Root modules (layers, examples' callers) keep theirs.
+    if ($ComponentType -eq "Module") {
+        $excludeFiles += ".terraform.lock.hcl"
+    }
+
+    $trackedFiles = Get-GitTrackedFileSet -Directory $resolvedSource
+
     $copiedFiles = @()
 
     $items = Get-ChildItem -Path $resolvedSource -Recurse -Force | Where-Object {
         $relPath = $_.FullName.Substring($resolvedSource.Length).TrimStart('\', '/')
         $pathParts = $relPath.Split([char]0x5C, [char]0x2F)
+
+        if ($pathParts[0] -in $ExcludeTopLevel) { return $false }
+
+        if ($null -ne $trackedFiles) {
+            # Directories are created on demand for the files beneath them, so an untracked
+            # directory never appears in the release as an empty folder.
+            if ($_.PSIsContainer) { return $false }
+            if (-not $trackedFiles.Contains($relPath.Replace('\', '/'))) { return $false }
+        }
 
         $isExcludedDir = $false
         foreach ($part in $pathParts) {
@@ -266,6 +350,172 @@ function Protect-GitOutput {
     return ($Text -replace "https://[^/@\s]+@", "https://***@")
 }
 
+# Set by Set-GitSshCommand for an SSH-transport release; applied to every Git process this
+# module starts, and never written to the caller's environment or to any Git config.
+$script:GitSshCommand = $null
+$script:GitSshKeyPath = $null
+
+function Get-GitSshCommand {
+    <#
+    .SYNOPSIS
+        Builds the ssh command Git runs for an SSH-transport release.
+    .DESCRIPTION
+        IdentitiesOnly stops an ssh-agent offering some other key first, which GitHub would
+        accept as some other account. BatchMode makes a passphrase or an unknown host key fail
+        immediately instead of waiting on a prompt nobody can answer. Host keys are still
+        checked against known_hosts.
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $false)]
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$KeyPath
+    )
+
+    $command = "ssh -o BatchMode=yes"
+    if (-not [string]::IsNullOrWhiteSpace($KeyPath)) {
+        # Git hands GIT_SSH_COMMAND to a POSIX shell, so forward slashes and double quotes.
+        $resolved = (Resolve-Path -Path $KeyPath -ErrorAction Stop).ProviderPath -replace '\\', '/'
+        $command += " -o IdentitiesOnly=yes -i `"$resolved`""
+    }
+
+    return $command
+}
+
+function Set-GitSshCommand {
+    <#
+    .SYNOPSIS
+        Sets (or, with no -KeyPath, clears) the ssh command used by Git processes this module starts.
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $false)]
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$KeyPath,
+
+        [Parameter(Mandatory = $false)]
+        [switch]$Clear
+    )
+
+    if ($Clear.IsPresent) {
+        $script:GitSshCommand = $null
+        $script:GitSshKeyPath = $null
+        return
+    }
+
+    $script:GitSshCommand = Get-GitSshCommand -KeyPath $KeyPath
+    $script:GitSshKeyPath = if ([string]::IsNullOrWhiteSpace($KeyPath)) { $null } else { (Resolve-Path -Path $KeyPath -ErrorAction Stop).ProviderPath }
+}
+
+function Get-GitRemoteUrl {
+    <#
+    .SYNOPSIS
+        Returns the URL Git uses to reach a GitHub repository for fetch, ls-remote and push.
+    .DESCRIPTION
+        'https' embeds the token as a transient credential; it is passed as a command argument
+        only and never stored. 'ssh' authenticates with the SSH key instead. An SSH key is not
+        subject to OAuth scopes, so it can push '.github/workflows/*' where a token without the
+        'workflow' scope cannot. GitHub API calls still use the token either way.
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("https", "ssh")]
+        [string]$Transport,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Owner,
+
+        [Parameter(Mandatory = $true)]
+        [string]$RepoName,
+
+        [Parameter(Mandatory = $false)]
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$Token
+    )
+
+    if ($Transport -eq "ssh") {
+        return "git@github.com:$Owner/$RepoName.git"
+    }
+
+    if ([string]::IsNullOrWhiteSpace($Token)) {
+        return "https://github.com/$Owner/$RepoName.git"
+    }
+
+    return "https://x-access-token:$Token@github.com/$Owner/$RepoName.git"
+}
+
+function ConvertFrom-GitHubSshGreeting {
+    <#
+    .SYNOPSIS
+        Extracts the login from GitHub's 'ssh -T' greeting, or $null when authentication failed.
+    .EXAMPLE
+        ConvertFrom-GitHubSshGreeting -Text "Hi octocat! You've successfully authenticated, ..."   # octocat
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $false)]
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$Text
+    )
+
+    if ([string]::IsNullOrEmpty($Text)) { return $null }
+    $match = [regex]::Match($Text, "Hi (?<login>[A-Za-z0-9-]+)(?:/[A-Za-z0-9._-]+)?! You've successfully authenticated")
+    if ($match.Success) { return $match.Groups["login"].Value }
+    return $null
+}
+
+function Test-GitHubSshIdentity {
+    <#
+    .SYNOPSIS
+        Checks which GitHub account the configured SSH key authenticates as.
+    .DESCRIPTION
+        Run before anything is created, so a key that does not authenticate fails the release
+        up front instead of after every repository has been created empty.
+    #>
+    [CmdletBinding()]
+    param ()
+
+    # Prefer the ssh bundled with Git for Windows, which is the one Git itself runs.
+    $sshExe = "ssh"
+    $gitCommand = Get-Command -Name "git" -ErrorAction SilentlyContinue
+    if ($null -ne $gitCommand) {
+        # git.exe sits in '<root>\cmd' or '<root>\mingw64\bin' depending on what is on PATH.
+        $gitBin = Split-Path -Path $gitCommand.Source -Parent
+        foreach ($root in @((Split-Path -Path $gitBin -Parent), (Split-Path -Path (Split-Path -Path $gitBin -Parent) -Parent))) {
+            $bundled = Join-Path -Path $root -ChildPath "usr\bin\ssh.exe"
+            if (Test-Path -Path $bundled) { $sshExe = $bundled; break }
+        }
+    }
+
+    $pinfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $pinfo.FileName = $sshExe
+    foreach ($arg in @("-o", "BatchMode=yes")) { $pinfo.ArgumentList.Add($arg) }
+    if ($script:GitSshKeyPath) {
+        foreach ($arg in @("-o", "IdentitiesOnly=yes", "-i", $script:GitSshKeyPath)) { $pinfo.ArgumentList.Add($arg) }
+    }
+    foreach ($arg in @("-T", "git@github.com")) { $pinfo.ArgumentList.Add($arg) }
+    $pinfo.RedirectStandardOutput = $true
+    $pinfo.RedirectStandardError = $true
+    $pinfo.UseShellExecute = $false
+    $pinfo.CreateNoWindow = $true
+
+    $process = [System.Diagnostics.Process]::Start($pinfo)
+    $stdout = $process.StandardOutput.ReadToEnd()
+    $stderr = $process.StandardError.ReadToEnd()
+    $process.WaitForExit()
+
+    $text = ($stdout + "`n" + $stderr).Trim()
+    return [PSCustomObject]@{
+        Login  = ConvertFrom-GitHubSshGreeting -Text $text
+        Output = $text
+    }
+}
+
 function Invoke-GitCommand {
     [CmdletBinding()]
     param (
@@ -286,6 +536,9 @@ function Invoke-GitCommand {
 
     # Never allow Git to block on an interactive credential or host prompt during automation.
     $pinfo.EnvironmentVariables["GIT_TERMINAL_PROMPT"] = "0"
+    if ($script:GitSshCommand) {
+        $pinfo.EnvironmentVariables["GIT_SSH_COMMAND"] = $script:GitSshCommand
+    }
 
     foreach ($arg in $Arguments) {
         $pinfo.ArgumentList.Add($arg)
@@ -324,7 +577,7 @@ function Get-ComponentReleaseAction {
     [CmdletBinding()]
     param (
         [Parameter(Mandatory = $true)]
-        [ValidateSet("Deployment", "Module")]
+        [ValidateSet("Management", "Deployment", "Module")]
         [string]$ComponentType,
 
         [Parameter(Mandatory = $true)]
@@ -347,10 +600,11 @@ function Get-ComponentReleaseAction {
         }
     }
 
-    if ($ComponentType -eq "Deployment" -and $SeedDeploymentOnce -and -not $ForceDeploymentUpdate) {
+    # The management repository holds the same 'accounts/**' tree, one directory down.
+    if ($ComponentType -in @("Deployment", "Management") -and $SeedDeploymentOnce -and -not $ForceDeploymentUpdate) {
         return [PSCustomObject]@{
             Action = "Skip"
-            Reason = "Deployment repository has already been seeded. Operator edits under 'accounts/**' would be reverted by a re-release, so it is skipped. Use -ForceDeploymentUpdate to override."
+            Reason = "$ComponentType repository has already been seeded. Operator edits under 'accounts/**' would be reverted by a re-release, so it is skipped. Use -ForceDeploymentUpdate to override."
         }
     }
 
@@ -454,6 +708,41 @@ function Get-RemoteRepositoryState {
         Branches      = $heads
         HasTargetHead = ($heads -contains $DefaultBranch)
     }
+}
+
+function Get-LatestSemVerTag {
+    <#
+    .SYNOPSIS
+        Returns the highest strict vX.Y.Z tag a remote repository carries.
+    .DESCRIPTION
+        Only strict SemVer tags are considered, matching the module CI's next-version.sh, so a
+        hand-made tag such as 'v2-rc' can never be what a layer is pinned to. Reachable is
+        $false when the remote cannot be queried, typically because the repository does not
+        exist yet.
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$WorkingDirectory,
+
+        [Parameter(Mandatory = $true)]
+        [string]$AuthenticatedUrl
+    )
+
+    $result = Invoke-GitCommand -WorkingDirectory $WorkingDirectory -Arguments @("ls-remote", "--tags", "--refs", $AuthenticatedUrl)
+    if ($result.ExitCode -ne 0) {
+        return [PSCustomObject]@{ Reachable = $false; Tag = $null; Error = $result.Error }
+    }
+
+    $tags = @(
+        $result.Output -split "`r?`n" | ForEach-Object {
+            ($_ -split "\s+")[-1] -replace "^refs/tags/", ""
+        } | Where-Object { $_ -match '^v\d+\.\d+\.\d+$' }
+    )
+
+    $latest = $tags | Sort-Object -Property { [version]$_.Substring(1) } -Descending | Select-Object -First 1
+
+    return [PSCustomObject]@{ Reachable = $true; Tag = $latest; Error = "" }
 }
 
 function Initialize-StagingRepository {
@@ -608,9 +897,14 @@ function Publish-LocalRepository {
         # GitHub refuses a push that adds or changes .github/workflows/* unless the token carries
         # the 'workflow' scope, and its message does not say which setting to change.
         $hint = if ($pushRes.Error -match "workflow.*scope|without .workflow.") {
-            " The release includes GitHub Actions workflows: a classic PAT needs the 'workflow' scope, and a fine-grained PAT needs 'Workflows: Read and write'."
+            " The release includes GitHub Actions workflows: a classic PAT needs the 'workflow' scope, and a fine-grained PAT needs 'Workflows: Read and write'. For the gh CLI token, run 'gh auth refresh -s workflow', or push with an SSH key instead: -GitTransport ssh -SshKeyPath <key>."
         }
-        elseif (-not $AllowForcePush.IsPresent -and $pushRes.Error -match "non-fast-forward|fetch first|rejected") {
+        elseif ($pushRes.Error -match "Permission denied \(publickey\)|Host key verification failed") {
+            " The SSH push could not authenticate. Check that -SshKeyPath names a key added to the GitHub account, that it has no passphrase (or is loaded in ssh-agent), and that github.com is in known_hosts."
+        }
+        # '[rejected]' only: '[remote rejected]' is the remote failing to store the push (an
+        # unpacker error, a hook, a ruleset), which force-pushing would not fix.
+        elseif (-not $AllowForcePush.IsPresent -and $pushRes.Error -match "non-fast-forward|fetch first|! \[rejected\]") {
             " The remote carries commits that are not present locally. Re-run with -AllowForcePush only if overwriting the remote history is intended."
         }
         else {
@@ -635,7 +929,14 @@ Export-ModuleMember -Function @(
     "Get-ComponentReleaseAction",
     "Initialize-StagingRepository",
     "Get-RemoteRepositoryState",
+    "Get-LatestSemVerTag",
+    "Get-GitTrackedFileSet",
     "Publish-LocalRepository",
+    "Get-GitSshCommand",
+    "Set-GitSshCommand",
+    "Get-GitRemoteUrl",
+    "ConvertFrom-GitHubSshGreeting",
+    "Test-GitHubSshIdentity",
     "Invoke-GitCommand",
     "Protect-GitOutput",
     "Get-ComponentGitIgnoreContent",
