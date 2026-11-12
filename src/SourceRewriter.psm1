@@ -12,7 +12,11 @@
 
 # Upstream references this tool knows how to repoint. Anything else, such as a registry
 # module or a third-party Git source, is left exactly as written.
-$script:RelativeModulePattern = '^(?:\.{1,2}/)+modules/(?<module>[A-Za-z0-9_-]+)/?$'
+#
+# A relative upstream reference climbs out of the layer with at least one '../'. A source
+# such as './modules/schema' names a child module that lives inside the layer and ships
+# with it, so it is not an upstream reference however its last segment is spelled.
+$script:RelativeModulePattern = '^(?:\./)?(?:\.\./)+modules/(?<module>[A-Za-z0-9_-]+)/?$'
 $script:PlaceholderModulePattern = '^git::https://github\.com/[^/]+/(?:cloudflare-platform-modules|CloudflareLandingZone)(?:\.git)?//(?:modules/)?(?<module>[A-Za-z0-9_-]+)/?(?:\?ref=[^"]*)?$'
 $script:SourceLinePattern = '^(?<lead>\s*source\s*=\s*")(?<source>[^"]*)(?<trail>".*)$'
 
@@ -23,6 +27,7 @@ function Get-UpstreamModuleName {
     .EXAMPLE
         Get-UpstreamModuleName -Source "../../../modules/zone_base"                                          # zone_base
         Get-UpstreamModuleName -Source "git::https://github.com/Your-Org/cloudflare-platform-modules//waf"   # waf
+        Get-UpstreamModuleName -Source "./modules/schema"                                                    # $null (a child module inside the layer)
         Get-UpstreamModuleName -Source "cloudflare/cloudflare"                                               # $null
     #>
     [CmdletBinding()]
@@ -60,6 +65,40 @@ function Get-ModuleRepositorySource {
     )
 
     return "git::https://github.com/$Owner/$RepoName.git?ref=$Ref"
+}
+
+function Test-SourceStaysWithin {
+    <#
+    .SYNOPSIS
+        True when a relative module source, resolved from the file that declares it, stays
+        inside -Directory.
+    .DESCRIPTION
+        Upstream's relative references climb out of the layers tree to the repository's
+        'modules/' directory. A child module nested in a layer (for example
+        'layers/zerotrust/modules/schema') can name a sibling as '../modules/<name>', which
+        matches the upstream form textually but resolves inside the layer. Such a source is
+        local to the published repository and must be left exactly as written.
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$Source,
+
+        [Parameter(Mandatory = $true)]
+        [string]$DeclaringFile,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Directory
+    )
+
+    if ($Source -notmatch '^\.{1,2}/') { return $false }
+
+    $separators = [char[]]@([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
+    $boundary = [System.IO.Path]::GetFullPath($Directory).TrimEnd($separators) + [System.IO.Path]::DirectorySeparatorChar
+    $fileDirectory = Split-Path -Path $DeclaringFile -Parent
+    $resolved = [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($fileDirectory, $Source)).TrimEnd($separators) + [System.IO.Path]::DirectorySeparatorChar
+
+    return $resolved.StartsWith($boundary, [System.StringComparison]::OrdinalIgnoreCase)
 }
 
 function Get-LayerTerraformFile {
@@ -113,6 +152,7 @@ function Find-LayerModuleReference {
             $source = $sourceMatch.Groups["source"].Value
             $moduleName = Get-UpstreamModuleName -Source $source
             if ($null -eq $moduleName) { continue }
+            if (Test-SourceStaysWithin -Source $source -DeclaringFile $file.FullName -Directory $LayersDirectory) { continue }
 
             $references.Add([PSCustomObject]@{
                     File       = $file.FullName
@@ -164,6 +204,7 @@ function Update-LayerModuleSource {
             $source = $sourceMatch.Groups["source"].Value
             $moduleName = Get-UpstreamModuleName -Source $source
             if ($null -eq $moduleName -or -not $SourceMap.ContainsKey($moduleName)) { continue }
+            if (Test-SourceStaysWithin -Source $source -DeclaringFile $file.FullName -Directory $LayersDirectory) { continue }
 
             $replacement = $SourceMap[$moduleName]
             $lines[$i] = $sourceMatch.Groups["lead"].Value + $replacement + $sourceMatch.Groups["trail"].Value

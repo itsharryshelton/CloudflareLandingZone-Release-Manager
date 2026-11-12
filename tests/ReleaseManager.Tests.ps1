@@ -101,6 +101,18 @@ module "legacy" {
   source = "../../../modules/retired_module"
 }
 "@
+        # A layer with child modules of its own, as zerotrust carries modules/schema. Both
+        # children are named after a published module so a false match would be repointed.
+        Set-TestFile $root "deployment/layers/access/access.tf" @"
+module "schema" {
+  source = "./modules/zone_base"
+}
+"@
+        Set-TestFile $root "deployment/layers/access/modules/zone_base/main.tf" @"
+module "sibling" {
+  source = "../modules/zone_rules"
+}
+"@
         foreach ($m in @("_TEMPLATE", "zone_base", "dns_records", "cache_rules", "zone_rules")) {
             Set-TestFile $root "modules/$m/main.tf" "# $m"
         }
@@ -858,6 +870,8 @@ Describe "Module Source Rewriting" {
         }
 
         It "Should leave <Source> alone" -ForEach @(
+            @{ Source = "./modules/schema" }
+            @{ Source = "./modules/zone_base" }
             @{ Source = "cloudflare/cloudflare" }
             @{ Source = "terraform-aws-modules/vpc/aws" }
             @{ Source = "git::https://github.com/acme/terraform-cloudflare-lz-zone-base.git?ref=v1.0.0" }
@@ -906,6 +920,26 @@ Describe "Module Source Rewriting" {
             # Provider sources and unknown modules are untouched.
             (Get-Content -Path (Join-Path $script:staged "deployment\layers\zones\terraform.tf") -Raw) | Should -Match ([regex]::Escape('source  = "cloudflare/cloudflare"'))
             (Get-Content -Path (Join-Path $script:staged "deployment\layers\legacy\legacy.tf") -Raw) | Should -Match ([regex]::Escape('"../../../modules/retired_module"'))
+        }
+
+        It "Should leave a layer's own child modules alone, even when one shares a published module's name" {
+            $result = Set-OrchestrationModuleSource -StagingDirectory $script:staged -ComponentType "Management" `
+                -ModuleRepoNames $script:repoNames -Owner "acme" -ModuleSourceRef "v1.2.3"
+
+            @($result.Rewrites | Where-Object { $_.File -match 'layers.access.' }) | Should -BeNullOrEmpty
+            # Neither child is reported as an unknown upstream module either.
+            $result.UnknownModules | Should -Be @("retired_module")
+
+            (Get-Content -Path (Join-Path $script:staged "deployment\layers\access\access.tf") -Raw) |
+                Should -Match ([regex]::Escape('source = "./modules/zone_base"'))
+            (Get-Content -Path (Join-Path $script:staged "deployment\layers\access\modules\zone_base\main.tf") -Raw) |
+                Should -Match ([regex]::Escape('source = "../modules/zone_rules"'))
+        }
+
+        It "Should report only references that climb out of the layers tree" {
+            $refs = @(Find-LayerModuleReference -LayersDirectory (Join-Path $script:staged "deployment\layers") -KnownModules @($script:repoNames.Keys))
+            @($refs | Where-Object { $_.File -match 'layers.access.' }) | Should -BeNullOrEmpty
+            @($refs | Where-Object { $_.ModuleName -eq "zone_base" }).Count | Should -Be 1
         }
 
         It "Should grant modules-auth exactly the module repositories the layers source" {
